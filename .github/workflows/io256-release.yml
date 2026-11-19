@@ -94,6 +94,13 @@ jobs:
         run: |
           bash release/srpm.sh source "$RUNNER_TEMP/deps" "$RUNNER_TEMP/rpmbuild" "$RPM_VERSION" "$RPM_RELEASE"
           cp "$RUNNER_TEMP"/rpmbuild/SRPMS/*.src.rpm dist/
+      - name: Save macOS crash reports
+        if: failure() && runner.os == 'macOS'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: crash-${{ matrix.target }}
+          path: ~/Library/Logs/DiagnosticReports/tmux*.ips
+          if-no-files-found: ignore
       - name: Save build log
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

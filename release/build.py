@@ -133,6 +133,9 @@ def main():
             run(["./configure", f"--prefix={prefix}", f"--libdir={prefix}/lib",
                  "--disable-shared", "--enable-static"], jemalloc)
             make_install(jemalloc)
+            # Darwin's malloc-zone registration lives in a constructor-only
+            # archive member. Keep it when linking the static library.
+            extra_link += f" -Wl,-force_load,{prefix}/lib/libjemalloc.a"
         run(["sh", "autogen.sh"], source)
         platform_options = ["--enable-static"] if linux else ["--enable-jemalloc"]
         static_link = "-static " if linux else ""
@@ -149,6 +152,9 @@ def main():
         if "INTERP" in elf or "(NEEDED)" in elf:
             raise ValueError("Linux binary depends on shared libraries at startup")
     else:
+        symbols = subprocess.check_output(["nm", "-jU", binary], text=True).splitlines()
+        if not any(symbol.endswith("zone_register") for symbol in symbols):
+            raise ValueError("jemalloc's Darwin malloc-zone constructor was omitted")
         libs = subprocess.check_output(["otool", "-L", binary], text=True).splitlines()[1:]
         if not libs or any(not line.strip().startswith(("/usr/lib/", "/System/Library/"))
                            for line in libs):
