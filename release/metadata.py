@@ -23,7 +23,6 @@ formula = f'''class TmuxIo256 < Formula
   homepage "https://github.com/{repo}"
   version "{tag.removeprefix('v')}"
   license "ISC"
-  depends_on :macos
   depends_on macos: :sequoia
 
   on_arm do

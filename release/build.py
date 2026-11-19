@@ -63,7 +63,7 @@ def main():
     env.update(CC="gcc" if linux else "clang", CFLAGS="-O2",
                PKG_CONFIG_LIBDIR=str(prefix / "lib/pkgconfig"))
     extra_link = env.pop("RELEASE_LDFLAGS", "")
-    env["LDFLAGS"] = extra_link
+    env.pop("LDFLAGS", None)
     if not linux:
         env["MACOSX_DEPLOYMENT_TARGET"] = "15.0"
     jobs = min(12, os.cpu_count() or 2)
@@ -126,11 +126,12 @@ def main():
         make_install(build)
         run(["sh", "autogen.sh"], source)
         static = ["--enable-static"] if linux else []
+        static_link = "-static " if linux else ""
         run(["./configure", "--prefix=/usr", "--disable-debug", "--enable-images",
              "--enable-utf8proc", "--disable-systemd", "--disable-utempter", *static,
              "CFLAGS=-O2 -g -fno-omit-frame-pointer -pthread",
              f"CPPFLAGS=-I{prefix}/include -I{prefix}/include/ncursesw",
-             f"LDFLAGS=-pthread -L{prefix}/lib {extra_link}", "YACC=bison -y"], source)
+             f"LDFLAGS={static_link}-pthread -L{prefix}/lib {extra_link}", "YACC=bison -y"], source)
         run([make, f"-j{jobs}"], source)
     binary = source / "tmux"
     subprocess.run([binary, "-V"], check=True)
