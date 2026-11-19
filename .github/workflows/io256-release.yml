@@ -149,37 +149,7 @@ jobs:
 
   copr:
     needs: [pin, publish]
-    runs-on: ubuntu-24.04
-    env:
-      COPR_CONFIG: ${{ secrets.COPR_CONFIG }}
-      COPR_OWNER: ${{ vars.COPR_OWNER }}
-      RELEASE_TAG: ${{ needs.pin.outputs.tag }}
-    steps:
-      - name: Submit the released source RPM to Fedora Copr
-        shell: bash
-        run: |
-          if [ -z "$COPR_CONFIG" ]; then
-            echo "::warning::Set the COPR_CONFIG Actions secret to activate Fedora publication"
-            exit 0
-          fi
-          umask 077
-          mkdir -p "$RUNNER_TEMP/copr"
-          printf '%s\n' "$COPR_CONFIG" > "$RUNNER_TEMP/copr/config"
-          unset COPR_CONFIG
-          docker run --rm -v "$RUNNER_TEMP/copr/config:/root/.config/copr:ro"             -e COPR_OWNER -e RELEASE_TAG -e GITHUB_REPOSITORY fedora:44 bash -euc '
-            dnf -q -y install copr-cli python3
-            owner=${COPR_OWNER:-$(python3 -c "from configparser import ConfigParser; c=ConfigParser(); c.read(\"/root/.config/copr\"); print(c[\"copr-cli\"][\"username\"])")}
-            project="$owner/tmux-io256"
-            version=${RELEASE_TAG#v}
-            rpm_version=${version%-io256.*}
-            rpm_release=${version##*.}
-            srpm="tmux-io256-$rpm_version-$rpm_release.src.rpm"
-            url="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$srpm"
-            if ! copr-cli get "$project"; then
-              copr-cli create "$project" --chroot fedora-44-x86_64 --chroot fedora-44-aarch64                 --description "Static glibc tmux io256 builds"
-            fi
-            copr-cli build --background --enable-net off "$project" "$url"
-          '
-      - name: Remove the temporary credentials file
-        if: always()
-        run: rm -f "$RUNNER_TEMP/copr/config"
+    uses: ./.github/workflows/io256-copr.yml
+    with:
+      release_tag: ${{ needs.pin.outputs.tag }}
+    secrets: inherit
