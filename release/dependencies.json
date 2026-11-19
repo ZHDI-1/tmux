@@ -1,0 +1,27 @@
+{
+  "libevent": {
+    "url": "https://github.com/libevent/libevent/releases/download/release-2.1.13-stable/libevent-2.1.13-stable.tar.gz",
+    "archive": "libevent.tar.gz",
+    "sha256": "f7e9383b8c0baa81b687e5b5eecc01beefaf1b19b64151d95ed61647fe7a315c"
+  },
+  "utf8proc": {
+    "url": "https://github.com/JuliaStrings/utf8proc/archive/refs/tags/v2.11.3.tar.gz",
+    "archive": "utf8proc.tar.gz",
+    "sha256": "abfed50b6d4da51345713661370290f4f4747263ee73dc90356299dfc7990c78"
+  },
+  "libpng": {
+    "url": "https://download.sourceforge.net/libpng/libpng-1.6.58.tar.xz",
+    "archive": "libpng.tar.xz",
+    "sha256": "28eb403f51f0f7405249132cecfe82ea5c0ef97f1b32c5a65828814ae0d34775"
+  },
+  "zlib-ng": {
+    "url": "https://github.com/zlib-ng/zlib-ng/archive/refs/tags/2.3.3.tar.gz",
+    "archive": "zlib-ng.tar.gz",
+    "sha256": "f9c65aa9c852eb8255b636fd9f07ce1c406f061ec19a2e7d508b318ca0c907d1"
+  },
+  "ncurses": {
+    "url": "https://ftp.gnu.org/gnu/ncurses/ncurses-6.6.tar.gz",
+    "archive": "ncurses.tar.gz",
+    "sha256": "355b4cbbed880b0381a04c46617b7656e362585d52e9cf84a67e2009b749ff11"
+  }
+}

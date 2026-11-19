@@ -1,0 +1,185 @@
+name: io256 release
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the verified matrix and submit the Copr build
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: io256-release
+  cancel-in-progress: false
+
+jobs:
+  pin:
+    runs-on: ubuntu-24.04
+    outputs:
+      source: ${{ steps.pin.outputs.source }}
+      tag: ${{ steps.pin.outputs.tag }}
+      rpm_version: ${{ steps.pin.outputs.rpm_version }}
+      rpm_release: ${{ steps.pin.outputs.rpm_release }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - id: pin
+        shell: bash
+        run: |
+          jq -e '
+            (.source_commit | test("^[0-9a-f]{40}$")) and
+            (.tag | test("^v[0-9]+(\\.[0-9]+)+-io256\\.[1-9][0-9]*$")) and
+            (.rpm_version | test("^[0-9]+(\\.[0-9]+)+$")) and
+            (.rpm_release | type == "number" and . > 0 and . == floor) and
+            (.tag == ("v" + .rpm_version + "-io256." + (.rpm_release | tostring)))
+          ' release/pin.json
+          source_sha=$(jq -r .source_commit release/pin.json)
+          git merge-base --is-ancestor "$source_sha" HEAD
+          echo "source=$source_sha" >> "$GITHUB_OUTPUT"
+          jq -r '"tag=\(.tag)", "rpm_version=\(.rpm_version)", "rpm_release=\(.rpm_release)"' release/pin.json >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: pin
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {target: linux-x86_64, runner: ubuntu-24.04, machine: x86_64}
+          - {target: linux-arm64, runner: ubuntu-24.04-arm, machine: aarch64}
+          - {target: macos-x86_64, runner: macos-15-intel, machine: x86_64}
+          - {target: macos-arm64, runner: macos-15, machine: arm64}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.pin.outputs.source }}
+          path: source
+          persist-credentials: false
+      - name: Linux build tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake bison build-essential binutils locales ncurses-bin pkg-config rpm
+          sudo locale-gen en_US.UTF-8
+      - name: macOS build tools
+        if: runner.os == 'macOS'
+        run: |
+          brew install autoconf automake bison make pkgconf ncurses
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix ncurses)/bin" >> "$GITHUB_PATH"
+      - name: Build and smoke test
+        shell: bash
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+          RELEASE_MACHINE: ${{ matrix.machine }}
+          RELEASE_TAG: ${{ needs.pin.outputs.tag }}
+        run: |
+          test "$(uname -m)" = "$RELEASE_MACHINE"
+          python3 release/build.py --cache "$RUNNER_TEMP/deps" --source source --work "$RUNNER_TEMP/build"
+          bash release/package.sh "$PWD/source" "$PWD/dist" "$RELEASE_TAG" "$RELEASE_TARGET" "$RUNNER_TEMP/build"
+      - name: Assemble source RPM
+        if: matrix.target == 'linux-x86_64'
+        shell: bash
+        env:
+          RPM_VERSION: ${{ needs.pin.outputs.rpm_version }}
+          RPM_RELEASE: ${{ needs.pin.outputs.rpm_release }}
+        run: |
+          bash release/srpm.sh source "$RUNNER_TEMP/deps" "$RUNNER_TEMP/rpmbuild" "$RPM_VERSION" "$RPM_RELEASE"
+          cp "$RUNNER_TEMP"/rpmbuild/SRPMS/*.src.rpm dist/
+      - name: Save build log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: log-${{ matrix.target }}
+          path: ${{ runner.temp }}/build/build.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: dist-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.src.rpm
+          if-no-files-found: error
+
+  publish:
+    if: github.repository == 'ZHDI-1/tmux' && github.ref == 'refs/heads/release/io256' && inputs.publish
+    needs: [pin, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          path: dist
+          pattern: dist-*
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.pin.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.pin.outputs.source }}
+        shell: bash
+        run: |
+          cp release/pin.json dist/
+          python3 release/metadata.py dist "$RELEASE_TAG" "$GITHUB_REPOSITORY"
+          cd dist
+          sha256sum -c SHA256SUMS
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft > "$RUNNER_TEMP/release.json"; then
+            if jq -e '.isDraft == false' "$RUNNER_TEMP/release.json" >/dev/null; then
+              existing=$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq .sha)
+              test "$existing" = "$RELEASE_COMMIT"
+              echo "Release already published at the pinned source."
+              exit 0
+            fi
+          else
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --target "$RELEASE_COMMIT"               --draft --title "tmux io256 $RELEASE_TAG" --notes-file ../release/INSTALL.md
+          fi
+          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber             ./*.tar.gz ./*.src.rpm SHA256SUMS pin.json tmux-io256.rb
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+
+  copr:
+    needs: [pin, publish]
+    runs-on: ubuntu-24.04
+    env:
+      COPR_CONFIG: ${{ secrets.COPR_CONFIG }}
+      COPR_OWNER: ${{ vars.COPR_OWNER }}
+      RELEASE_TAG: ${{ needs.pin.outputs.tag }}
+    steps:
+      - name: Submit the released source RPM to Fedora Copr
+        shell: bash
+        run: |
+          if [ -z "$COPR_CONFIG" ]; then
+            echo "::warning::Set the COPR_CONFIG Actions secret to activate Fedora publication"
+            exit 0
+          fi
+          umask 077
+          mkdir -p "$RUNNER_TEMP/copr"
+          printf '%s\n' "$COPR_CONFIG" > "$RUNNER_TEMP/copr/config"
+          unset COPR_CONFIG
+          docker run --rm -v "$RUNNER_TEMP/copr/config:/root/.config/copr:ro"             -e COPR_OWNER -e RELEASE_TAG -e GITHUB_REPOSITORY fedora:44 bash -euc '
+            dnf -q -y install copr-cli python3
+            owner=${COPR_OWNER:-$(python3 -c "from configparser import ConfigParser; c=ConfigParser(); c.read(\"/root/.config/copr\"); print(c[\"copr-cli\"][\"username\"])")}
+            project="$owner/tmux-io256"
+            version=${RELEASE_TAG#v}
+            rpm_version=${version%-io256.*}
+            rpm_release=${version##*.}
+            srpm="tmux-io256-$rpm_version-$rpm_release.src.rpm"
+            url="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$srpm"
+            if ! copr-cli get "$project"; then
+              copr-cli create "$project" --chroot fedora-44-x86_64 --chroot fedora-44-aarch64                 --description "Static glibc tmux io256 builds"
+            fi
+            copr-cli build --background --enable-net off "$project" "$url"
+          '
+      - name: Remove the temporary credentials file
+        if: always()
+        run: rm -f "$RUNNER_TEMP/copr/config"
