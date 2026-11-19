@@ -30,6 +30,8 @@ if [[ $target == linux-* ]]; then
     gcc --version >> "$output/$base/toolchain.txt"
 else
     strip -S "$output/$base/tmux"
+    codesign --force --sign - "$output/$base/tmux"
+    codesign --verify "$output/$base/tmux"
     clang --version > "$output/$base/toolchain.txt"
 fi
 git -C "$source_dir" rev-parse HEAD > "$output/$base/source-commit.txt"
