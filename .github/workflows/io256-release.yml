@@ -106,7 +106,9 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: log-${{ matrix.target }}
-          path: ${{ runner.temp }}/build/build.log
+          path: |
+            ${{ runner.temp }}/build/build.log
+            source/config.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: dist-${{ matrix.target }}

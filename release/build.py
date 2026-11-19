@@ -135,7 +135,9 @@ def main():
             make_install(jemalloc)
             # Darwin's malloc-zone registration lives in a constructor-only
             # archive member. Keep it when linking the static library.
-            extra_link += f" -Wl,-force_load,{prefix}/lib/libjemalloc.a"
+            env["JEMALLOC_LIBS"] = (
+                f"{jemalloc}/src/zone.o -L{prefix}/lib -ljemalloc"
+            )
         run(["sh", "autogen.sh"], source)
         platform_options = ["--enable-static"] if linux else ["--enable-jemalloc"]
         static_link = "-static " if linux else ""
