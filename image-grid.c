@@ -216,10 +216,26 @@ const struct grid_cell *
 image_map_cell(struct tty *tty, struct grid *gd, u_int x, u_int y,
     const struct grid_cell *gc, struct grid_cell *out, int *empty)
 {
-	image_tty_update(tty);
-	if (tty->image_backend->map_cell == NULL)
+	image_map_cb map_cell = image_prepare_map(tty, gd, y);
+
+	if (map_cell == NULL)
 		return (gc);
-	return (tty->image_backend->map_cell(tty, gd, x, y, gc, out, empty));
+	return (map_cell(tty, gd, x, y, gc, out, empty));
+}
+
+/*
+ * Select mapping once for a synchronous row draw. Terminal features and cell
+ * pixels cannot change while tty_draw_line is dispatching that row's cells.
+ * An allocated, but empty, image row still needs fallback mapping semantics.
+ */
+image_map_cb
+image_prepare_map(struct tty *tty, struct grid *gd, u_int y)
+{
+	image_tty_update(tty);
+	if (tty->image_backend->map_cell == NULL ||
+	    y >= gd->hsize + gd->sy || gd->linedata[y].images == NULL)
+		return (NULL);
+	return (tty->image_backend->map_cell);
 }
 
 /* Draw a clipped part of one image span. */

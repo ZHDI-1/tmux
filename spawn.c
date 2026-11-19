@@ -318,9 +318,14 @@ spawn_pane(struct spawn_context *sc, char **cause)
 			free(cwd);
 			return (NULL);
 		}
+		pane_io_destroy(sc->wp0);
 		if (sc->wp0->event != NULL) {
 			bufferevent_free(sc->wp0->event);
 			sc->wp0->event = NULL;
+		}
+		if (sc->wp0->input != NULL) {
+			evbuffer_free(sc->wp0->input);
+			sc->wp0->input = NULL;
 		}
 		if (sc->wp0->fd != -1) {
 			window_pane_utmp_remove(sc->wp0);

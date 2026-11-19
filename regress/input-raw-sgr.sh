@@ -36,4 +36,27 @@ check_raw_matches hyperlink \
 	'C 0,0 data=\(1,1,A\) flags=NONE\[0\].* link=https://example.com/a linkid=id1' \
 	'C 0,1 data=\(1,1,B\) flags=NONE\[0\].* link=NONE linkid=NONE'
 
+start_pane numeric-limits 12 3 '\033[31mA\033[2147483647;32mB\033[2147483648;34mC\033[999999999999999999999999999999999;35mD\033[;34mE'
+check_capture numeric-limits 'ABCDE'
+check_raw_matches numeric-limits \
+	'C 0,0 data=\(1,1,A\).* fg=red\[1\]' \
+	'C 0,1 data=\(1,1,B\).* fg=green\[2\]' \
+	'C 0,2 data=\(1,1,C\).* fg=green\[2\]' \
+	'C 0,3 data=\(1,1,D\).* fg=green\[2\]' \
+	'C 0,4 data=\(1,1,E\).* fg=blue\[4\]'
+
+# Saving and restoring the alternate screen copies extended-cell storage.
+# Further RGB writes must grow the copy's own allocation, not its source's.
+start_pane rgb-copy 40 3 '\033[38;2;1;2;3mAB\033[?1049hZ\033[?1049lCDEFGHIJKLMNOPQRSTUVWXYZ'
+check_capture rgb-copy 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+check_raw_matches rgb-copy \
+	'C 0,0 data=\(1,1,A\).* fg=#010203\[2010203\]' \
+	'C 0,25 data=\(1,1,Z\).* fg=#010203\[2010203\]'
+
+start_pane rgb-clear 40 3 '\033[48;2;4;5;6m\033[K\033[38;2;1;2;3mA\033[40GZ'
+check_raw_matches rgb-clear \
+	'C 0,0 data=\(1,1,A\).* fg=#010203\[2010203\] bg=#040506\[2040506\]' \
+	'C 0,20 data=\(1,1, \).* bg=#040506\[2040506\]' \
+	'C 0,39 data=\(1,1,Z\).* fg=#010203\[2010203\] bg=#040506\[2040506\]'
+
 exit $exit_status

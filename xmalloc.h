@@ -46,4 +46,8 @@ int	 xvsnprintf(char *, size_t, const char *, va_list)
 		__attribute__((__nonnull__ (3)))
 		__attribute__((__bounded__ (__string__, 1, 2)));
 
+/* Explicit pool ownership: never mix these pointers with free/realloc. */
+void *xpool_reallocarray(void *, size_t, size_t);
+void xpool_free(void *);
+
 #endif	/* XMALLOC_H */

@@ -499,6 +499,8 @@ window_pane_destroy_ready(struct window_pane *wp)
 {
 	int	n;
 
+	if (!pane_io_finished(wp))
+		return (0);
 	if (wp->pipe_fd != -1 && EVBUFFER_LENGTH(wp->pipe_event->output) != 0)
 		return (0);
 	if (ioctl(wp->fd, FIONREAD, &n) != -1 && n > 0)
@@ -1465,6 +1467,9 @@ window_pane_create(struct window *w, u_int sx, u_int sy, u_int hlimit)
 	char			 host[HOST_NAME_MAX + 1];
 
 	wp = xcalloc(1, sizeof *wp);
+	wp->input = evbuffer_new();
+	if (wp->input == NULL)
+		fatalx("out of memory");
 	wp->references = 1;
 	wp->window = w;
 	wp->options = options_create(w->options);
@@ -1633,6 +1638,7 @@ window_pane_utmp_remove(__unused struct window_pane *wp)
 static void
 window_pane_destroy(struct window_pane *wp)
 {
+	pane_io_destroy(wp);
 	window_pane_wait_finish(wp);
 	spawn_editor_finish(wp);
 
@@ -1646,6 +1652,10 @@ window_pane_destroy(struct window_pane *wp)
 	if (wp->event != NULL) {
 		bufferevent_free(wp->event);
 		wp->event = NULL;
+	}
+	if (wp->input != NULL) {
+		evbuffer_free(wp->input);
+		wp->input = NULL;
 	}
 	if (wp->fd != -1) {
 		window_pane_utmp_remove(wp);
@@ -1696,15 +1706,41 @@ window_pane_free(struct window_pane *wp)
 }
 
 static void
-window_pane_read_callback(__unused struct bufferevent *bufev, void *data)
+window_pane_read_callback(struct bufferevent *bufev, void *data)
 {
 	struct window_pane		*wp = data;
-	struct evbuffer			*evb = wp->event->input;
+	struct evbuffer			*evb = wp->input;
 	struct window_pane_offset	*wpo = &wp->pipe_offset;
-	size_t				 size = EVBUFFER_LENGTH(evb);
+	size_t				 size;
 	char				*new_data;
 	size_t				 new_size;
 	struct client			*c;
+	struct client			*loop;
+	int				 nread, controls = 0;
+	u_int				 reads;
+	size_t				 budget = 64 * 1024;
+	size_t				 incoming = EVBUFFER_LENGTH(bufev->input);
+
+	/* Do not read ahead while control clients can retain output. */
+	TAILQ_FOREACH(loop, &clients, entry) {
+		if (loop->session != NULL && (loop->flags & CLIENT_CONTROL)) {
+			controls = 1;
+			break;
+		}
+	}
+
+	/* Drain the libevent-owned input; append only to our own buffer. */
+	if (evbuffer_add_buffer(evb, bufev->input) != 0)
+		fatalx("cannot move pane input");
+	if (!controls && wp->fd != -1 && incoming < 65536) {
+		for (reads = 0; reads < 16 && budget != 0; reads++) {
+			nread = evbuffer_read(evb, wp->fd, budget);
+			if (nread <= 0)
+				break; /* Leave EOF/error for the next bufferevent read. */
+			budget -= nread;
+		}
+	}
+	size = EVBUFFER_LENGTH(evb);
 
 	if (wp->pipe_fd != -1) {
 		new_data = window_pane_get_new_data(wp, wpo, &new_size);
@@ -1721,6 +1757,59 @@ window_pane_read_callback(__unused struct bufferevent *bufev, void *data)
 	}
 	input_parse_pane(wp);
 	bufferevent_disable(wp->event, EV_READ);
+}
+
+/* Called only on the main event loop; borrowed bytes survive until return. */
+void
+window_pane_io_data(struct window_pane *wp, const u_char *a, size_t na,
+    const u_char *b, size_t nb)
+{
+	struct client *c;
+	void *data;
+	size_t size;
+	int controls = 0;
+
+	TAILQ_FOREACH(c, &clients, entry) {
+		if (c->session != NULL && (c->flags & CLIENT_CONTROL)) {
+			controls = 1;
+			break;
+		}
+	}
+	wp->last_output_time = time(NULL);
+	if (!controls && wp->pipe_fd == -1 && EVBUFFER_LENGTH(wp->input) == 0 &&
+	    wp->offset.used == wp->base_offset) {
+		input_parse_buffers(wp, a, na, b, nb);
+		/* No retained consumers: advance the empty-buffer coordinate together. */
+		if (wp->base_offset > SIZE_MAX - na - nb)
+			wp->base_offset = 0;
+		wp->base_offset += na + nb;
+		wp->offset.used = wp->base_offset;
+		return;
+	}
+	/* Preserve existing independent offsets for pipe/control consumers. */
+	if (evbuffer_add(wp->input, a, na) != 0 ||
+	    (nb != 0 && evbuffer_add(wp->input, b, nb) != 0))
+		fatalx("cannot retain pane io input");
+	if (wp->pipe_fd != -1) {
+		data = window_pane_get_new_data(wp, &wp->pipe_offset, &size);
+		if (size != 0) {
+			bufferevent_write(wp->pipe_event, data, size);
+			window_pane_update_used_data(wp, &wp->pipe_offset, size);
+		}
+	}
+	TAILQ_FOREACH(c, &clients, entry) {
+		if (c->session != NULL && (c->flags & CLIENT_CONTROL))
+			control_write_output(c, wp);
+	}
+	input_parse_pane(wp);
+}
+
+void
+window_pane_io_eof(struct window_pane *wp)
+{
+	wp->flags |= PANE_EXITED;
+	if (window_pane_destroy_ready(wp))
+		server_destroy_pane(wp, 1);
 }
 
 static void
@@ -1740,6 +1829,11 @@ void
 window_pane_set_event(struct window_pane *wp)
 {
 	setblocking(wp->fd, 0);
+	if (wp->input == NULL) {
+		wp->input = evbuffer_new();
+		if (wp->input == NULL)
+			fatalx("out of memory");
+	}
 
 	wp->event = bufferevent_new(wp->fd, window_pane_read_callback,
 	    NULL, window_pane_error_callback, wp);
@@ -1747,7 +1841,10 @@ window_pane_set_event(struct window_pane *wp)
 		fatalx("out of memory");
 	wp->ictx = input_init(wp, &wp->palette);
 
-	bufferevent_enable(wp->event, EV_READ|EV_WRITE);
+	if (pane_io_start(wp))
+		bufferevent_enable(wp->event, EV_WRITE);
+	else
+		bufferevent_enable(wp->event, EV_READ|EV_WRITE);
 }
 
 void
@@ -2635,8 +2732,8 @@ window_pane_get_new_data(struct window_pane *wp,
 {
 	size_t	used = wpo->used - wp->base_offset;
 
-	*size = EVBUFFER_LENGTH(wp->event->input) - used;
-	return (EVBUFFER_DATA(wp->event->input) + used);
+	*size = EVBUFFER_LENGTH(wp->input) - used;
+	return (EVBUFFER_DATA(wp->input) + used);
 }
 
 void
@@ -2645,8 +2742,8 @@ window_pane_update_used_data(struct window_pane *wp,
 {
 	size_t	used = wpo->used - wp->base_offset;
 
-	if (size > EVBUFFER_LENGTH(wp->event->input) - used)
-		size = EVBUFFER_LENGTH(wp->event->input) - used;
+	if (size > EVBUFFER_LENGTH(wp->input) - used)
+		size = EVBUFFER_LENGTH(wp->input) - used;
 	wpo->used += size;
 }
 

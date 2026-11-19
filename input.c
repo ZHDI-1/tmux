@@ -27,6 +27,7 @@
 #include <time.h>
 
 #include "tmux.h"
+#include <event2/buffer.h>
 
 /*
  * Based on the description by Paul Williams at:
@@ -142,7 +143,9 @@ struct input_ctx {
 	 * control clients on connection.
 	 */
 	struct evbuffer			*since_ground;
+	int				 since_ground_pending;
 	struct event			 ground_timer;
+	int				 ground_timer_armed;
 #ifdef ENABLE_IMAGES
 	void				*kitty_state;
 #endif
@@ -204,6 +207,9 @@ static void	input_csi_dispatch_winops(struct input_ctx *);
 static void	input_csi_dispatch_sgr_256(struct input_ctx *, int, u_int *);
 static void	input_csi_dispatch_sgr_rgb(struct input_ctx *, int, u_int *);
 static void	input_csi_dispatch_sgr(struct input_ctx *);
+static void	input_csi_dispatch_sgr_numbers(struct input_ctx *, const int *, u_int);
+static void	input_csi_dispatch_cup_args(struct input_ctx *, int, int);
+static void	input_csi_dispatch_cup(struct input_ctx *);
 static int	input_dcs_dispatch(struct input_ctx *);
 static int	input_top_bit_set(struct input_ctx *);
 static int	input_end_bel(struct input_ctx *);
@@ -363,6 +369,8 @@ struct input_state {
 	void				(*enter)(struct input_ctx *);
 	void				(*exit)(struct input_ctx *);
 	const struct input_transition	*transitions;
+	const struct input_transition	*lookup[256];
+	u_char				 collect[256];
 };
 
 /* State transitions available from all states. */
@@ -391,122 +399,139 @@ static const struct input_transition input_state_rename_string_table[];
 static const struct input_transition input_state_consume_st_table[];
 
 /* ground state definition. */
-static const struct input_state input_state_ground = {
+static struct input_state input_state_ground = {
 	"ground",
 	input_ground, NULL,
-	input_state_ground_table
+	input_state_ground_table,
+	{ 0 }
 };
 
 /* esc_enter state definition. */
-static const struct input_state input_state_esc_enter = {
+static struct input_state input_state_esc_enter = {
 	"esc_enter",
 	input_clear, NULL,
-	input_state_esc_enter_table
+	input_state_esc_enter_table,
+	{ 0 }
 };
 
 /* esc_intermediate state definition. */
-static const struct input_state input_state_esc_intermediate = {
+static struct input_state input_state_esc_intermediate = {
 	"esc_intermediate",
 	NULL, NULL,
-	input_state_esc_intermediate_table
+	input_state_esc_intermediate_table,
+	{ 0 }
 };
 
 /* csi_enter state definition. */
-static const struct input_state input_state_csi_enter = {
+static struct input_state input_state_csi_enter = {
 	"csi_enter",
 	input_clear, NULL,
-	input_state_csi_enter_table
+	input_state_csi_enter_table,
+	{ 0 }
 };
 
 /* csi_parameter state definition. */
-static const struct input_state input_state_csi_parameter = {
+static struct input_state input_state_csi_parameter = {
 	"csi_parameter",
 	NULL, NULL,
-	input_state_csi_parameter_table
+	input_state_csi_parameter_table,
+	{ 0 }
 };
 
 /* csi_intermediate state definition. */
-static const struct input_state input_state_csi_intermediate = {
+static struct input_state input_state_csi_intermediate = {
 	"csi_intermediate",
 	NULL, NULL,
-	input_state_csi_intermediate_table
+	input_state_csi_intermediate_table,
+	{ 0 }
 };
 
 /* csi_ignore state definition. */
-static const struct input_state input_state_csi_ignore = {
+static struct input_state input_state_csi_ignore = {
 	"csi_ignore",
 	NULL, NULL,
-	input_state_csi_ignore_table
+	input_state_csi_ignore_table,
+	{ 0 }
 };
 
 /* dcs_enter state definition. */
-static const struct input_state input_state_dcs_enter = {
+static struct input_state input_state_dcs_enter = {
 	"dcs_enter",
 	input_enter_dcs, NULL,
-	input_state_dcs_enter_table
+	input_state_dcs_enter_table,
+	{ 0 }
 };
 
 /* dcs_parameter state definition. */
-static const struct input_state input_state_dcs_parameter = {
+static struct input_state input_state_dcs_parameter = {
 	"dcs_parameter",
 	NULL, NULL,
-	input_state_dcs_parameter_table
+	input_state_dcs_parameter_table,
+	{ 0 }
 };
 
 /* dcs_intermediate state definition. */
-static const struct input_state input_state_dcs_intermediate = {
+static struct input_state input_state_dcs_intermediate = {
 	"dcs_intermediate",
 	NULL, NULL,
-	input_state_dcs_intermediate_table
+	input_state_dcs_intermediate_table,
+	{ 0 }
 };
 
 /* dcs_handler state definition. */
-static const struct input_state input_state_dcs_handler = {
+static struct input_state input_state_dcs_handler = {
 	"dcs_handler",
 	NULL, NULL,
-	input_state_dcs_handler_table
+	input_state_dcs_handler_table,
+	{ 0 }
 };
 
 /* dcs_escape state definition. */
-static const struct input_state input_state_dcs_escape = {
+static struct input_state input_state_dcs_escape = {
 	"dcs_escape",
 	NULL, NULL,
-	input_state_dcs_escape_table
+	input_state_dcs_escape_table,
+	{ 0 }
 };
 
 /* dcs_ignore state definition. */
-static const struct input_state input_state_dcs_ignore = {
+static struct input_state input_state_dcs_ignore = {
 	"dcs_ignore",
 	NULL, NULL,
-	input_state_dcs_ignore_table
+	input_state_dcs_ignore_table,
+	{ 0 }
 };
 
 /* osc_string state definition. */
-static const struct input_state input_state_osc_string = {
+static struct input_state input_state_osc_string = {
 	"osc_string",
 	input_enter_osc, input_exit_osc,
-	input_state_osc_string_table
+	input_state_osc_string_table,
+	{ 0 }
 };
 
 /* apc_string state definition. */
-static const struct input_state input_state_apc_string = {
+static struct input_state input_state_apc_string = {
 	"apc_string",
 	input_enter_apc, input_exit_apc,
-	input_state_apc_string_table
+	input_state_apc_string_table,
+	{ 0 }
 };
 
 /* rename_string state definition. */
-static const struct input_state input_state_rename_string = {
+static struct input_state input_state_rename_string = {
 	"rename_string",
 	input_enter_rename, input_exit_rename,
-	input_state_rename_string_table
+	input_state_rename_string_table,
+	{ 0 }
 };
 
 /* consume_st state definition. */
-static const struct input_state input_state_consume_st = {
+static struct input_state input_state_consume_st = {
 	"consume_st",
 	input_enter_rename, NULL, /* rename also waits for ST */
-	input_state_consume_st_table
+	input_state_consume_st_table,
+	{ 0 }
 };
 
 /* ground state table. */
@@ -819,6 +844,7 @@ input_ground_timer_callback(__unused int fd, __unused short events, void *arg)
 	struct input_ctx	*ictx = arg;
 
 	log_debug("%s: %s expired" , __func__, ictx->state->name);
+	ictx->ground_timer_armed = 0;
 	input_reset(ictx, 0);
 }
 
@@ -829,6 +855,7 @@ input_start_ground_timer(struct input_ctx *ictx)
 	struct timeval	tv = { .tv_sec = 5, .tv_usec = 0 };
 
 	event_add(&ictx->ground_timer, &tv);
+	ictx->ground_timer_armed = 1;
 }
 
 /* Reset cell state to default. */
@@ -871,12 +898,69 @@ input_restore_state(struct input_ctx *ictx)
 	screen_write_cursormove(sctx, ictx->old_cx, ictx->old_cy, 0);
 }
 
+/* Preserve the first matching transition for every state and byte. */
+static void
+input_init_lookup(void)
+{
+	static int			 initialized;
+	struct input_state		*states[] = {
+		&input_state_ground,
+		&input_state_esc_enter,
+		&input_state_esc_intermediate,
+		&input_state_csi_enter,
+		&input_state_csi_parameter,
+		&input_state_csi_intermediate,
+		&input_state_csi_ignore,
+		&input_state_dcs_enter,
+		&input_state_dcs_parameter,
+		&input_state_dcs_intermediate,
+		&input_state_dcs_handler,
+		&input_state_dcs_escape,
+		&input_state_dcs_ignore,
+		&input_state_osc_string,
+		&input_state_apc_string,
+		&input_state_rename_string,
+		&input_state_consume_st
+	};
+	const struct input_transition	*itr;
+	u_int				 i, ch;
+
+	if (initialized)
+		return;
+	for (i = 0; i < nitems(states); i++) {
+		for (ch = 0; ch < 256; ch++) {
+			itr = states[i]->transitions;
+			while (itr->first != -1 && itr->last != -1) {
+				if (ch >= (u_int)itr->first &&
+				    ch <= (u_int)itr->last)
+					break;
+				itr++;
+			}
+			if (itr->first == -1 || itr->last == -1)
+				fatalx("no transition from state");
+			states[i]->lookup[ch] = itr;
+			if (itr->state == NULL) {
+				if (itr->handler == NULL)
+					states[i]->collect[ch] = 1;
+				else if (itr->handler == input_parameter)
+					states[i]->collect[ch] = 2;
+				else if (itr->handler == input_intermediate)
+					states[i]->collect[ch] = 3;
+				else if (itr->handler == input_input)
+					states[i]->collect[ch] = 4;
+			}
+		}
+	}
+	initialized = 1;
+}
+
 /* Initialise input parser. */
 struct input_ctx *
 input_init(struct window_pane *wp, struct colour_palette *palette)
 {
 	struct input_ctx	*ictx;
 
+	input_init_lookup();
 	ictx = xcalloc(1, sizeof *ictx);
 	ictx->wp = wp;
 	ictx->palette = palette;
@@ -967,37 +1051,476 @@ input_set_state(struct input_ctx *ictx, const struct input_transition *itr)
 		ictx->state->enter(ictx);
 }
 
+/* Completed colour SGR parameters are independent of a pane's current style. */
+struct input_csi_cache {
+	u_char key[64];
+	u_int length, count;
+	int compiled;
+	union {
+		int values[24];
+		struct {
+			u_int attr_and, attr_or;
+			int fg, bg, us;
+			u_char colours, reset;
+		} op;
+	} u;
+};
+static struct input_csi_cache input_csi_cache[512];
+static u_int input_csi_cache_attempts, input_csi_cache_hits;
+static u_int input_csi_cache_bypass;
+
+/* Unrepeated colour streams use the ordinary parser after a bounded probe. */
+static void
+input_csi_cache_note(int hit)
+{
+	input_csi_cache_hits += hit;
+	if (++input_csi_cache_attempts == 512) {
+		if (input_csi_cache_hits < 256)
+			input_csi_cache_bypass = 8192;
+		input_csi_cache_attempts = input_csi_cache_hits = 0;
+	}
+}
+
+/* Numeric SGR consists of attribute bit operations and field assignments. */
+static void
+input_csi_cache_compile(struct input_csi_cache *cache)
+{
+	struct input_ctx scratch;
+	struct grid_cell zero, ones;
+
+	/* This handler reads and changes only cell.cell. Evaluate both bit poles. */
+	memset(&scratch.cell.cell, 0, sizeof scratch.cell.cell);
+	input_csi_dispatch_sgr_numbers(&scratch, cache->u.values, cache->count);
+	zero = scratch.cell.cell;
+	memset(&scratch.cell.cell, 0xff, sizeof scratch.cell.cell);
+	input_csi_dispatch_sgr_numbers(&scratch, cache->u.values, cache->count);
+	ones = scratch.cell.cell;
+	cache->u.op.attr_and = zero.attr ^ ones.attr;
+	cache->u.op.attr_or = zero.attr;
+	cache->u.op.colours = (zero.fg == ones.fg ? 1 : 0) |
+	    (zero.bg == ones.bg ? 2 : 0) | (zero.us == ones.us ? 4 : 0);
+	cache->u.op.fg = zero.fg;
+	cache->u.op.bg = zero.bg;
+	cache->u.op.us = zero.us;
+	cache->u.op.reset = zero.flags == ones.flags;
+	cache->compiled = 1;
+}
+
+static void
+input_csi_cache_apply(struct input_ctx *ictx, struct input_csi_cache *cache)
+{
+	struct grid_cell *gc = &ictx->cell.cell;
+	u_int link;
+
+	/* All cached keys have parameters; explicit SGR0 preserves the link. */
+	if (cache->u.op.reset) {
+		link = gc->link;
+		*gc = grid_default_cell;
+		gc->link = link;
+	}
+	gc->attr = (gc->attr & cache->u.op.attr_and) | cache->u.op.attr_or;
+	if (cache->u.op.colours & 1)
+		gc->fg = cache->u.op.fg;
+	if (cache->u.op.colours & 2)
+		gc->bg = cache->u.op.bg;
+	if (cache->u.op.colours & 4)
+		gc->us = cache->u.op.us;
+}
+
+/* Return a bounded cache candidate; a complete key comparison proves a hit. */
+static struct input_csi_cache *
+input_csi_cache_find(const u_char *buf, size_t len, size_t *length)
+{
+	const u_char *end;
+	uint32_t a, b, c, d, hash;
+
+	if (len < 12 || (buf[2] != '3' && buf[2] != '4' && buf[2] != '5') ||
+	    buf[3] != '8' || buf[4] != ';' || log_get_level() != 0)
+		return (NULL);
+	if (input_csi_cache_bypass != 0) {
+		input_csi_cache_bypass--;
+		return (NULL);
+	}
+	if (len > sizeof input_csi_cache[0].key)
+		len = sizeof input_csi_cache[0].key;
+	end = memchr(buf + 2, 'm', len - 2);
+	if (end == NULL)
+		return (NULL);
+	*length = end - buf + 1;
+	if (*length < 12)
+		return (NULL);
+	/* Unaligned-safe samples; collisions are checked against every key byte. */
+	memcpy(&a, buf + 4, sizeof a);
+	memcpy(&b, buf + (*length - 4) / 2, sizeof b);
+	memcpy(&c, buf + *length - 8, sizeof c);
+	memcpy(&d, buf + *length / 4, sizeof d);
+	hash = a + b * UINT32_C(0x9e3779b1) + *length;
+	hash = (hash ^ c) * UINT32_C(0x85ebca6b);
+	hash = (hash ^ d) * UINT32_C(0xc2b2ae35);
+	hash ^= hash >> 16;
+	return (&input_csi_cache[hash & (nitems(input_csi_cache) - 1)]);
+}
+
+/*
+ * Parse complete ordinary SGR and CUP parameters while recognizing them.
+ * Leave incomplete, complex and invalid sequences to the state machine,
+ * without changing its state while looking ahead. With logging enabled,
+ * use the state machine so its parameter diagnostics remain available.
+ */
+static size_t
+input_try_csi(struct input_ctx *ictx, const u_char *buf, size_t len)
+{
+	int	 numbers[nitems(ictx->param_list)], present = 0;
+	const int *values = numbers;
+	struct input_csi_cache *cache;
+	size_t cache_length = 0;
+	int cache_hit = 0;
+	uint64_t n = 0;
+	u_char	 ch;
+	u_int	 count = 0, i;
+	size_t	 end;
+
+	if (len < 3 || buf[1] != '[')
+		return (0);
+	cache = input_csi_cache_find(buf, len, &cache_length);
+	if (cache != NULL) {
+		cache_hit = cache->length == cache_length &&
+		    memcmp(cache->key, buf, cache_length) == 0;
+		input_csi_cache_note(cache_hit);
+	}
+	if (cache_hit) {
+		if (!cache->compiled)
+			input_csi_cache_compile(cache);
+		end = cache_length - 1;
+		ch = 'm';
+		goto parsed;
+	}
+	for (end = 2; end < len; end++) {
+		ch = buf[end];
+		if (ch >= '0' && ch <= '9') {
+			n = n * 10 + (ch - '0');
+			if (n > INT_MAX)
+				return (0);
+			present = 1;
+		} else if (ch == ';' || ch == 'm' || ch == 'H' || ch == 'f') {
+			if (end != 2 || ch == ';') {
+				if (count == nitems(numbers) - 1)
+					return (0);
+				numbers[count] = present ? (int)n : -1;
+				count++;
+			}
+			if (ch != ';')
+				break;
+			n = 0;
+			present = 0;
+		} else
+			return (0);
+		if (end - 2 == sizeof ictx->param_buf - 1)
+			return (0);
+	}
+	if (end == len || log_get_level() != 0)
+		return (0);
+
+	if (cache != NULL && ch == 'm' && end + 1 == cache_length) {
+		cache->length = cache_length;
+		cache->count = count;
+		cache->compiled = 0;
+		memcpy(cache->key, buf, cache_length);
+		memcpy(cache->u.values, numbers, count * sizeof *numbers);
+	}
+parsed:
+	if (ch == 'm')
+		screen_write_collect_end(&ictx->ctx);
+	input_clear(ictx);
+	ictx->ch = ch;
+	/* The raw parameter buffer is only needed by the state machine. */
+	for (i = 0; i < ictx->param_list_len; i++) {
+		if (ictx->param_list[i].type == INPUT_STRING)
+			free(ictx->param_list[i].str);
+	}
+	/* Completed numeric commands do not need persistent split parameters. */
+	ictx->param_list_len = 0;
+	if (cache_hit)
+		input_csi_cache_apply(ictx, cache);
+	else if (ch == 'm')
+		input_csi_dispatch_sgr_numbers(ictx, values, count);
+	else
+		input_csi_dispatch_cup_args(ictx,
+		    count > 0 && values[0] > 1 ? values[0] : 1,
+		    count > 1 && values[1] > 1 ? values[1] : 1);
+	ictx->flags &= ~INPUT_LAST;
+	input_ground(ictx);
+	return (end + 1);
+}
+
+/* Leave combining, joiner, modifier and Jamo cases to the scalar path. */
+static int
+input_utf8_independent(u_int cp, u_int width)
+{
+	if (width == 0 || width > 2)
+		return (0);
+	if (cp < 0x800)
+		return (1);
+	if ((cp >= 0x1100 && cp <= 0x11ff) || cp == 0x200d ||
+	    cp == 0x3164 || cp == 0xfe0f ||
+	    (cp >= 0xa960 && cp <= 0xa97c) ||
+	    (cp >= 0xd7b0 && cp <= 0xd7fb) ||
+	    (cp >= 0x1f1e6 && cp <= 0x1f1ff) ||
+	    (cp >= 0x1f3fb && cp <= 0x1f3ff))
+		return (0);
+	return (1);
+}
+
+/* Decode a run once and write its ordinary cells as one screen operation. */
+static size_t
+input_try_utf8(struct input_ctx *ictx, const u_char *buf, size_t len)
+{
+	struct screen		*s = ictx->ctx.s;
+	utf8_char		 data[128];
+	size_t			 off = 0;
+	u_int			 n = 0, width = 0, available, cp, columns;
+
+	if ((s->mode & MODE_INSERT) || s->sel != NULL || log_debug_enabled)
+		return (0);
+	screen_write_collect_end(&ictx->ctx);
+	available = screen_size_x(s);
+	if (~s->mode & MODE_WRAP)
+		available--;
+	if (s->cx >= available && (~s->mode & MODE_WRAP))
+		return (0);
+	available = s->cx < available ? available - s->cx : 0;
+	while (off < len && n < nitems(data)) {
+		data[n] = utf8_decode_inline(buf + off, len - off, &cp);
+		if (data[n] == 0)
+			break;
+		columns = UTF8_GET_WIDTH(data[n]);
+		if (n == 0 && columns > available && (s->mode & MODE_WRAP))
+			available = screen_size_x(s);
+		if (!input_utf8_independent(cp, columns) ||
+		    columns > available - width)
+			break;
+		width += columns;
+		off += UTF8_GET_SIZE(data[n]);
+		n++;
+	}
+	if (n == 0 || !screen_write_collect_add_utf8(&ictx->ctx,
+	    &ictx->cell.cell, data, n, width))
+		return (0);
+	ictx->ch = buf[off - 1];
+	utf8_to_data(data[n - 1], &ictx->utf8data);
+	utf8_copy(&ictx->cell.cell.data, &ictx->utf8data);
+	utf8_copy(&ictx->last, &ictx->cell.cell.data);
+	ictx->flags |= INPUT_LAST;
+	return (off);
+}
+
+/* Recognize complete ordinary ASCII lines without crossing a control. */
+static size_t
+input_try_lines(struct input_ctx *ictx, const u_char *buf, size_t len,
+    size_t *retry)
+{
+	struct screen	*s = ictx->ctx.s;
+	size_t		 off = 0, start, complete = 0, size, first_size = 0;
+	u_int		 lines = 0, width = screen_size_x(s);
+	u_char		 last = 0;
+	int		 uniform = 1;
+
+	if (s->cx != 0 ||
+	    s->cy != s->rlower || len < 4 * (size_t)screen_size_y(s) ||
+	    (s->mode & MODE_INSERT) || s->sel != NULL || log_debug_enabled)
+		return (0);
+	while (off < len) {
+		start = off;
+		while (off < len && buf[off] >= 0x20 && buf[off] < 0x7f)
+			off++;
+		if (off - start > width)
+			break;
+		size = off - start;
+		if (off < len && buf[off] == '\r' &&
+		    off + 1 < len && buf[off + 1] == '\n') {
+			if (off > start)
+				last = buf[off - 1];
+			off += 2;
+		} else if (off < len && buf[off] == '\n' &&
+		    (s->mode & MODE_CRLF)) {
+			if (off > start)
+				last = buf[off - 1];
+			off++;
+		} else
+			break;
+		if (lines == 0)
+			first_size = size;
+		else if (size != first_size || memcmp(buf, buf + start, size) != 0)
+			uniform = 0;
+		complete = off;
+		lines++;
+	}
+	/*
+	 * No suffix of these ordinary lines can fill the same scroll region.
+	 * Do not recognize the same bytes again after consuming one line.
+	 * The retry point stops before any other control, which may change
+	 * the region or interpretation. It never survives this input buffer.
+	 */
+	if (lines < s->rlower - s->rupper + 1) {
+		*retry = off;
+		return (0);
+	}
+	if (lines == 0 || !screen_write_collect_lines(&ictx->ctx,
+	    &ictx->cell.cell, buf, complete, lines, uniform)) {
+		/* The scalar path still consumes every byte. Avoid rescanning
+		 * this rejected ordinary-line prefix at every subsequent row.
+		 * Stop suppression before any unrecognized control or tail. */
+		*retry = complete;
+		return (0);
+	}
+	if (last != 0) {
+		utf8_set(&ictx->cell.cell.data, last);
+		utf8_copy(&ictx->last, &ictx->cell.cell.data);
+	}
+	ictx->ch = '\n';
+	ictx->flags &= ~INPUT_LAST;
+	return (complete);
+}
+
+/*
+ * Fuse self transitions whose actions only append bytes or ignore them.
+ * Enter/exit actions, UTF-8 decoding and terminal effects remain ordered in
+ * the ordinary dispatcher. Classes come from each byte's winning transition,
+ * so equal classes have equal actions without changing state.
+ */
+static size_t
+input_collect_span(struct input_ctx *ictx, const struct input_transition *itr,
+    const u_char *buf, size_t len)
+{
+	size_t		 used = 1, copy, room, available;
+	u_char		*dst;
+	size_t		*length;
+	u_char		 type = ictx->state->collect[buf[0]];
+
+	if (type == 0)
+		return (0);
+	while (used < len && ictx->state->collect[buf[used]] == type)
+		used++;
+	if (used == 1)
+		return (0);
+
+	if (itr->handler == input_parameter ||
+	    itr->handler == input_intermediate) {
+		if (itr->handler == input_parameter) {
+			dst = ictx->param_buf;
+			length = &ictx->param_len;
+			room = sizeof ictx->param_buf - 1 - *length;
+		} else {
+			dst = ictx->interm_buf;
+			length = &ictx->interm_len;
+			room = sizeof ictx->interm_buf - 1 - *length;
+		}
+		copy = used < room ? used : room;
+		memcpy(dst + *length, buf, copy);
+		*length += copy;
+		dst[*length] = '\0';
+		if (copy != used)
+			ictx->flags |= INPUT_DISCARD;
+	} else if (itr->handler == input_input) {
+		available = ictx->input_space;
+		while (used >= available - ictx->input_len) {
+			if (available * 2 > input_buffer_size)
+				break;
+			available *= 2;
+		}
+		if (available != ictx->input_space) {
+			ictx->input_buf = xrealloc(ictx->input_buf, available);
+			ictx->input_space = available;
+		}
+		room = available - 1 - ictx->input_len;
+		copy = used < room ? used : room;
+		memcpy(ictx->input_buf + ictx->input_len, buf, copy);
+		ictx->input_len += copy;
+		ictx->input_buf[ictx->input_len] = '\0';
+		if (copy != used)
+			ictx->flags |= INPUT_DISCARD;
+	}
+	ictx->ch = buf[used - 1];
+	return (used);
+}
+
+/* Build the two ASCII state values without copying just-written data. */
+static void
+input_set_ascii_last(struct input_ctx *ictx, u_char ch)
+{
+ static const struct utf8_data empty = { { 0 }, 1, 1, 1 };
+
+ /* Build both equal values directly. Copying the just-written35-byte
+  * object creates overlapping loads across utf8_set's tail stores. */
+ ictx->ch = ch;
+ ictx->cell.cell.data = empty;
+ ictx->last = empty;
+ ictx->cell.cell.data.data[0] = ictx->last.data[0] = ch;
+ ictx->flags |= INPUT_LAST;
+}
+
 /* Parse data. */
 static void
-input_parse(struct input_ctx *ictx, const u_char *buf, size_t len)
+input_parse(struct input_ctx* ictx, const u_char* buf, size_t len)
 {
-	struct screen_write_ctx		*sctx = &ictx->ctx;
-	const struct input_state	*state = NULL;
-	const struct input_transition	*itr = NULL;
-	size_t				 off = 0;
+	struct screen_write_ctx* sctx = &ictx->ctx;
+	const struct input_transition* itr = NULL;
+	size_t off = 0, since = 0, used;
+	size_t line_retry = 0, retry;
 
 	/* Parse the input. */
 	while (off < len) {
-		ictx->ch = buf[off++];
-
-		/* Find the transition. */
-		if (ictx->state != state ||
-		    itr == NULL ||
-		    ictx->ch < itr->first ||
-		    ictx->ch > itr->last) {
-			itr = ictx->state->transitions;
-			while (itr->first != -1 && itr->last != -1) {
-				if (ictx->ch >= itr->first &&
-				    ictx->ch <= itr->last)
-					break;
-				itr++;
-			}
-			if (itr->first == -1 || itr->last == -1) {
-				/* No transition? Eh? */
-				fatalx("no transition from state");
+		if (off >= line_retry && ictx->ctx.s->cx == 0
+		    && ictx->ctx.s->cy == ictx->ctx.s->rlower
+		    && ictx->state == &input_state_ground && buf[off] < 0x80
+		    && !ictx->utf8started
+		    && (ictx->cell.set == 0 ? ictx->cell.g0set
+					    : ictx->cell.g1set)
+			!= 1) {
+			retry = 0;
+			used = input_try_lines(ictx, buf + off, len - off, &retry);
+			line_retry = off + retry;
+			if (used != 0) {
+				off += used;
+				since = off;
+				continue;
 			}
 		}
-		state = ictx->state;
+		if (ictx->state == &input_state_ground && !ictx->utf8started &&
+		    buf[off] >= 0xc2 && buf[off] <= 0xf4 &&
+		    (ictx->cell.set == 0 ? ictx->cell.g0set : ictx->cell.g1set) != 1) {
+			used = input_try_utf8(ictx, buf + off, len - off);
+			if (used != 0) {
+				off += used;
+				since = off;
+				continue;
+			}
+		}
+		if (ictx->state == &input_state_ground &&
+		    buf[off] >= 0x20 && buf[off] < 0x7f &&
+		    !ictx->utf8started &&
+		    (ictx->cell.set == 0 ? ictx->cell.g0set : ictx->cell.g1set) != 1) {
+			used = screen_write_collect_add_ascii(sctx, &ictx->cell.cell,
+			    buf + off, len - off);
+			if (used != 0) {
+				off += used;
+				since = off;
+				input_set_ascii_last(ictx, buf[off - 1]);
+				continue;
+			}
+		}
+		if (buf[off] == '\033' && ictx->state == &input_state_ground) {
+			used = input_try_csi(ictx, buf + off, len - off);
+			if (used != 0) {
+				off += used;
+				since = off;
+				continue;
+			}
+		}
+		ictx->ch = buf[off++];
+
+		/* Find the transition directly from the current state and byte. */
+		itr = ictx->state->lookup[ictx->ch];
 
 		/*
 		 * Any state except print stops the current collection. This is
@@ -1009,46 +1532,103 @@ input_parse(struct input_ctx *ictx, const u_char *buf, size_t len)
 		if (itr->handler != input_print)
 			screen_write_collect_end(sctx);
 
+		if (log_get_level() == 0 &&
+		    (used = input_collect_span(ictx, itr, buf + off - 1,
+		    len - off + 1)) != 0) {
+			off += used - 1;
+			if (ictx->state == &input_state_ground)
+				since = off;
+			continue;
+		}
+
 		/*
 		 * Execute the handler, if any. Don't switch state if it
 		 * returns non-zero.
 		 */
-		if (itr->handler != NULL && itr->handler(ictx) != 0)
+		if (itr->handler != NULL && itr->handler(ictx) != 0) {
+			if (ictx->state != &input_state_ground && off - 1 > since) {
+				evbuffer_add(ictx->since_ground, buf + since,
+				    off - 1 - since);
+				ictx->since_ground_pending = 1;
+			}
+			since = off;
 			continue;
+		}
 
 		/* And switch state, if necessary. */
 		if (itr->state != NULL)
 			input_set_state(ictx, itr);
 
-		/* If not in ground state, save input. */
-		if (ictx->state != &input_state_ground)
-			evbuffer_add(ictx->since_ground, &ictx->ch, 1);
+		/* Only the unfinished sequence is needed after this parse. */
+		if (ictx->state == &input_state_ground)
+			since = off;
+	}
+	if (off > since) {
+		evbuffer_add(ictx->since_ground, buf + since, off - since);
+		ictx->since_ground_pending = 1;
 	}
 }
+
+static void input_parse_vectors(struct window_pane *,
+				const struct evbuffer_iovec *, int);
 
 /* Parse input from pane. */
 void
 input_parse_pane(struct window_pane *wp)
 {
-	void	*new_data;
-	size_t	 new_size;
+	struct evbuffer_iovec vec[32];
+	struct evbuffer_ptr pos;
+	const void *fallback;
+	size_t used = wp->offset.used - wp->base_offset;
+	size_t size = EVBUFFER_LENGTH(wp->input) - used;
+	int n;
 
-	new_data = window_pane_get_new_data(wp, &wp->offset, &new_size);
-	if (new_size != 0)
-		wp->last_output_time = time(NULL);
-	input_parse_buffer(wp, new_data, new_size);
-	window_pane_update_used_data(wp, &wp->offset, new_size);
+	if (size == 0)
+		return;
+	wp->last_output_time = time(NULL);
+	if (evbuffer_ptr_set(wp->input, &pos, used, EVBUFFER_PTR_SET) != 0)
+		fatalx("cannot locate pane input");
+	n = evbuffer_peek(wp->input, -1, &pos, vec, nitems(vec));
+	if (n > 0 && n <= (int)nitems(vec))
+		input_parse_vectors(wp, vec, n);
+	else {
+		fallback = window_pane_get_new_data(wp, &wp->offset, &size);
+		input_parse_buffer(wp, fallback, size);
+	}
+	window_pane_update_used_data(wp, &wp->offset, size);
 }
 
 /* Parse given input. */
 void
 input_parse_buffer(struct window_pane *wp, const u_char *buf, size_t len)
 {
-	struct input_ctx	*ictx = wp->ictx;
-	struct screen_write_ctx	*sctx = &ictx->ctx;
+	struct evbuffer_iovec vec = {.iov_base = (void *)buf, .iov_len = len};
+	if (len != 0)
+		input_parse_vectors(wp, &vec, 1);
+}
 
-	if (len == 0)
-		return;
+/* Keep one collection open while consuming borrowed evbuffer chains. */
+void
+input_parse_buffers(struct window_pane *wp, const u_char *a, size_t na,
+    const u_char *b, size_t nb)
+{
+	struct evbuffer_iovec vec[2] = {
+		{.iov_base = (void *)a, .iov_len = na},
+		{.iov_base = (void *)b, .iov_len = nb}
+	};
+	if (na != 0)
+		input_parse_vectors(wp, vec, nb != 0 ? 2 : 1);
+}
+
+/* Keep one collection open while consuming borrowed evbuffer chains. */
+static void
+input_parse_vectors(struct window_pane *wp, const struct evbuffer_iovec *vec,
+		    int count)
+{
+	struct input_ctx *ictx = wp->ictx;
+	struct screen_write_ctx *sctx = &ictx->ctx;
+
+	int n;
 
 	wp->output_generation++;
 	window_update_activity(wp->window);
@@ -1069,19 +1649,22 @@ input_parse_buffer(struct window_pane *wp, const u_char *buf, size_t len)
 		screen_write_start(sctx, &wp->base);
 	sctx->flags |= SCREEN_WRITE_INPUT;
 
-	log_debug("%s: %%%u %s, %zu bytes: %.*s", __func__, wp->id,
-	    ictx->state->name, len, (int)len, buf);
-
-	input_parse(ictx, buf, len);
+	for (n = 0; n < count; n++) {
+		log_debug("%s: %%%u %s, %zu bytes: %.*s", __func__, wp->id,
+			  ictx->state->name, vec[n].iov_len,
+			  (int)vec[n].iov_len, (const char *)vec[n].iov_base);
+		input_parse(ictx, vec[n].iov_base, vec[n].iov_len);
+	}
 	screen_write_stop(sctx);
 }
 
 /* Parse given input for screen. */
 void
 input_parse_screen(struct input_ctx *ictx, struct screen *s,
-    screen_write_init_ctx_cb cb, void *arg, const u_char *buf, size_t len)
+		   screen_write_init_ctx_cb cb, void *arg, const u_char *buf,
+		   size_t len)
 {
-	struct screen_write_ctx	*sctx = &ictx->ctx;
+	struct screen_write_ctx *sctx = &ictx->ctx;
 
 	if (len == 0)
 		return;
@@ -1096,10 +1679,11 @@ input_parse_screen(struct input_ctx *ictx, struct screen *s,
 static int
 input_split(struct input_ctx *ictx)
 {
-	const char		*errstr;
-	char			*ptr, *out;
-	struct input_param	*ip;
-	u_int			 i;
+	const char *errstr;
+	char *ptr, *out, *cp;
+	struct input_param *ip;
+	u_int i;
+	int n, digit;
 
 	for (i = 0; i < ictx->param_list_len; i++) {
 		if (ictx->param_list[i].type == INPUT_STRING)
@@ -1116,7 +1700,19 @@ input_split(struct input_ctx *ictx)
 		if (*out == '\0')
 			ip->type = INPUT_MISSING;
 		else {
-			if (strchr(out, ':') != NULL) {
+			/* Avoid general-purpose conversion for decimal parameters. */
+			n = 0;
+			for (cp = out; *cp >= '0' && *cp <= '9'; cp++) {
+				digit = *cp - '0';
+				if (n > INT_MAX / 10 ||
+				    (n == INT_MAX / 10 && digit > INT_MAX % 10))
+					break;
+				n = n * 10 + digit;
+			}
+			if (*cp == '\0') {
+				ip->type = INPUT_NUMBER;
+				ip->num = n;
+			} else if (strchr(out, ':') != NULL) {
 				ip->type = INPUT_STRING;
 				ip->str = xstrdup(out);
 			} else {
@@ -1130,6 +1726,9 @@ input_split(struct input_ctx *ictx)
 		if (ictx->param_list_len == nitems(ictx->param_list))
 			return (-1);
 	}
+
+	if (log_get_level() == 0)
+		return (0);
 
 	for (i = 0; i < ictx->param_list_len; i++) {
 		ip = &ictx->param_list[i];
@@ -1210,7 +1809,10 @@ input_reply(struct input_ctx *ictx, int add, const char *fmt, ...)
 static void
 input_clear(struct input_ctx *ictx)
 {
-	event_del(&ictx->ground_timer);
+	if (ictx->ground_timer_armed) {
+		event_del(&ictx->ground_timer);
+		ictx->ground_timer_armed = 0;
+	}
 
 	*ictx->interm_buf = '\0';
 	ictx->interm_len = 0;
@@ -1230,8 +1832,15 @@ input_clear(struct input_ctx *ictx)
 static void
 input_ground(struct input_ctx *ictx)
 {
-	event_del(&ictx->ground_timer);
-	evbuffer_drain(ictx->since_ground, EVBUFFER_LENGTH(ictx->since_ground));
+	if (ictx->ground_timer_armed) {
+		event_del(&ictx->ground_timer);
+		ictx->ground_timer_armed = 0;
+	}
+	if (ictx->since_ground_pending) {
+		evbuffer_drain(ictx->since_ground,
+		    EVBUFFER_LENGTH(ictx->since_ground));
+		ictx->since_ground_pending = 0;
+	}
 
 	if (ictx->input_space > INPUT_BUF_START) {
 		ictx->input_space = INPUT_BUF_START;
@@ -1535,10 +2144,7 @@ input_csi_dispatch(struct input_ctx *ictx)
 			screen_write_cursorright(sctx, n);
 		break;
 	case INPUT_CSI_CUP:
-		n = input_get(ictx, 0, 1, 1);
-		m = input_get(ictx, 1, 1, 1);
-		if (n != -1 && m != -1)
-			screen_write_cursormove(sctx, m - 1, n - 1, 1);
+		input_csi_dispatch_cup(ictx);
 		break;
 	case INPUT_CSI_MODSET:
 		n = input_get(ictx, 0, 0, 0);
@@ -1909,6 +2515,21 @@ input_csi_dispatch(struct input_ctx *ictx)
 
 	ictx->flags &= ~INPUT_LAST;
 	return (0);
+}
+
+/* Handle CUP through the same implementation for scalar and bulk parsing. */
+static void
+input_csi_dispatch_cup_args(struct input_ctx *ictx, int n, int m)
+{
+	if (n != -1 && m != -1)
+		screen_write_collect_cursormove(&ictx->ctx, m - 1, n - 1, 1);
+}
+
+static void
+input_csi_dispatch_cup(struct input_ctx *ictx)
+{
+	input_csi_dispatch_cup_args(ictx, input_get(ictx, 0, 1, 1),
+	    input_get(ictx, 1, 1, 1));
 }
 
 /* Handle CSI RM. */
@@ -2392,12 +3013,168 @@ input_csi_dispatch_sgr_colon(struct input_ctx *ictx, u_int i)
 	}
 }
 
+/* Apply an ordinary SGR value identically for either parser. */
+static void
+input_csi_dispatch_sgr_basic(struct grid_cell *gc, int n)
+{
+	u_int link;
+
+	switch (n) {
+	case 0:
+		link = gc->link;
+		memcpy(gc, &grid_default_cell, sizeof *gc);
+		gc->link = link;
+		break;
+	case 1:
+		gc->attr |= GRID_ATTR_BRIGHT;
+		break;
+	case 2:
+		gc->attr |= GRID_ATTR_DIM;
+		break;
+	case 3:
+		gc->attr |= GRID_ATTR_ITALICS;
+		break;
+	case 4:
+		gc->attr &= ~GRID_ATTR_ALL_UNDERSCORE;
+		gc->attr |= GRID_ATTR_UNDERSCORE;
+		break;
+	case 5:
+	case 6:
+		gc->attr |= GRID_ATTR_BLINK;
+		break;
+	case 7:
+		gc->attr |= GRID_ATTR_REVERSE;
+		break;
+	case 8:
+		gc->attr |= GRID_ATTR_HIDDEN;
+		break;
+	case 9:
+		gc->attr |= GRID_ATTR_STRIKETHROUGH;
+		break;
+	case 21:
+		gc->attr &= ~GRID_ATTR_ALL_UNDERSCORE;
+		gc->attr |= GRID_ATTR_UNDERSCORE_2;
+		break;
+	case 22:
+		gc->attr &= ~(GRID_ATTR_BRIGHT|GRID_ATTR_DIM);
+		break;
+	case 23:
+		gc->attr &= ~GRID_ATTR_ITALICS;
+		break;
+	case 24:
+		gc->attr &= ~GRID_ATTR_ALL_UNDERSCORE;
+		break;
+	case 25:
+		gc->attr &= ~GRID_ATTR_BLINK;
+		break;
+	case 27:
+		gc->attr &= ~GRID_ATTR_REVERSE;
+		break;
+	case 28:
+		gc->attr &= ~GRID_ATTR_HIDDEN;
+		break;
+	case 29:
+		gc->attr &= ~GRID_ATTR_STRIKETHROUGH;
+		break;
+	case 30:
+	case 31:
+	case 32:
+	case 33:
+	case 34:
+	case 35:
+	case 36:
+	case 37:
+		gc->fg = n - 30;
+		break;
+	case 39:
+		gc->fg = 8;
+		break;
+	case 40:
+	case 41:
+	case 42:
+	case 43:
+	case 44:
+	case 45:
+	case 46:
+	case 47:
+		gc->bg = n - 40;
+		break;
+	case 49:
+		gc->bg = 8;
+		break;
+	case 53:
+		gc->attr |= GRID_ATTR_OVERLINE;
+		break;
+	case 55:
+		gc->attr &= ~GRID_ATTR_OVERLINE;
+		break;
+	case 59:
+		gc->us = 8;
+		break;
+	case 90:
+	case 91:
+	case 92:
+	case 93:
+	case 94:
+	case 95:
+	case 96:
+	case 97:
+		gc->fg = n;
+		break;
+	case 100:
+	case 101:
+	case 102:
+	case 103:
+	case 104:
+	case 105:
+	case 106:
+	case 107:
+		gc->bg = n - 10;
+		break;
+	}
+}
+
+/* Numeric complete SGR parameters, without split-parameter allocations/copies. */
+static void
+input_csi_dispatch_sgr_numbers(struct input_ctx *ictx, const int *values,
+    u_int count)
+{
+	struct grid_cell *gc = &ictx->cell.cell;
+	u_int i;
+	int n, mode, r, g, b, c;
+
+	if (count == 0) {
+		memcpy(gc, &grid_default_cell, sizeof *gc);
+		return;
+	}
+	for (i = 0; i < count; i++) {
+		n = values[i] == -1 ? 0 : values[i];
+		if (n != 38 && n != 48 && n != 58) {
+			input_csi_dispatch_sgr_basic(gc, n);
+			continue;
+		}
+		i++;
+		mode = i < count ? values[i] : -1;
+		if (mode == 2) {
+			r = i + 1 < count ? values[i + 1] : -1;
+			g = i + 2 < count ? values[i + 2] : -1;
+			b = i + 3 < count ? values[i + 3] : -1;
+			if (input_csi_dispatch_sgr_rgb_do(ictx, n, r, g, b))
+				i += 3;
+		} else if (mode == 5) {
+			c = i + 1 < count ? values[i + 1] : -1;
+			if (input_csi_dispatch_sgr_256_do(ictx, n, c))
+				i++;
+		}
+	}
+}
+
 /* Handle CSI SGR. */
 static void
 input_csi_dispatch_sgr(struct input_ctx *ictx)
 {
 	struct grid_cell	*gc = &ictx->cell.cell;
-	u_int			 i, link;
+	u_int			 i;
 	int			 n;
 
 	if (ictx->param_list_len == 0) {
@@ -2427,119 +3204,7 @@ input_csi_dispatch_sgr(struct input_ctx *ictx)
 			continue;
 		}
 
-		switch (n) {
-		case 0:
-			link = gc->link;
-			memcpy(gc, &grid_default_cell, sizeof *gc);
-			gc->link = link;
-			break;
-		case 1:
-			gc->attr |= GRID_ATTR_BRIGHT;
-			break;
-		case 2:
-			gc->attr |= GRID_ATTR_DIM;
-			break;
-		case 3:
-			gc->attr |= GRID_ATTR_ITALICS;
-			break;
-		case 4:
-			gc->attr &= ~GRID_ATTR_ALL_UNDERSCORE;
-			gc->attr |= GRID_ATTR_UNDERSCORE;
-			break;
-		case 5:
-		case 6:
-			gc->attr |= GRID_ATTR_BLINK;
-			break;
-		case 7:
-			gc->attr |= GRID_ATTR_REVERSE;
-			break;
-		case 8:
-			gc->attr |= GRID_ATTR_HIDDEN;
-			break;
-		case 9:
-			gc->attr |= GRID_ATTR_STRIKETHROUGH;
-			break;
-		case 21:
-			gc->attr &= ~GRID_ATTR_ALL_UNDERSCORE;
-			gc->attr |= GRID_ATTR_UNDERSCORE_2;
-			break;
-		case 22:
-			gc->attr &= ~(GRID_ATTR_BRIGHT|GRID_ATTR_DIM);
-			break;
-		case 23:
-			gc->attr &= ~GRID_ATTR_ITALICS;
-			break;
-		case 24:
-			gc->attr &= ~GRID_ATTR_ALL_UNDERSCORE;
-			break;
-		case 25:
-			gc->attr &= ~GRID_ATTR_BLINK;
-			break;
-		case 27:
-			gc->attr &= ~GRID_ATTR_REVERSE;
-			break;
-		case 28:
-			gc->attr &= ~GRID_ATTR_HIDDEN;
-			break;
-		case 29:
-			gc->attr &= ~GRID_ATTR_STRIKETHROUGH;
-			break;
-		case 30:
-		case 31:
-		case 32:
-		case 33:
-		case 34:
-		case 35:
-		case 36:
-		case 37:
-			gc->fg = n - 30;
-			break;
-		case 39:
-			gc->fg = 8;
-			break;
-		case 40:
-		case 41:
-		case 42:
-		case 43:
-		case 44:
-		case 45:
-		case 46:
-		case 47:
-			gc->bg = n - 40;
-			break;
-		case 49:
-			gc->bg = 8;
-			break;
-		case 53:
-			gc->attr |= GRID_ATTR_OVERLINE;
-			break;
-		case 55:
-			gc->attr &= ~GRID_ATTR_OVERLINE;
-			break;
-		case 59:
-			gc->us = 8;
-			break;
-		case 90:
-		case 91:
-		case 92:
-		case 93:
-		case 94:
-		case 95:
-		case 96:
-		case 97:
-			gc->fg = n;
-			break;
-		case 100:
-		case 101:
-		case 102:
-		case 103:
-		case 104:
-		case 105:
-		case 106:
-		case 107:
-			gc->bg = n - 10;
-			break;
-		}
+		input_csi_dispatch_sgr_basic(gc, n);
 	}
 }
 

@@ -248,12 +248,8 @@ static struct utf8_index_tree utf8_index_tree = RB_INITIALIZER(utf8_index_tree);
 
 static int	utf8_no_width;
 static u_int	utf8_next_index;
-
-#define UTF8_GET_SIZE(uc) (((uc) >> 24) & 0x1f)
-#define UTF8_GET_WIDTH(uc) (((uc) >> 29) - 1)
-
-#define UTF8_SET_SIZE(size) (((utf8_char)(size)) << 24)
-#define UTF8_SET_WIDTH(width) ((((utf8_char)(width)) + 1) << 29)
+/* Zero means unknown; a cached width is stored plus one. */
+static u_char	utf8_width_memo[0x110000];
 
 /* Get a UTF-8 item from data. */
 static struct utf8_item *
@@ -412,6 +408,8 @@ utf8_update_width_cache(void)
 	struct options_array_item	*a;
 	u_int				 i;
 
+	memset(utf8_width_memo, 0, sizeof utf8_width_memo);
+
 	RB_FOREACH_SAFE (uw, utf8_width_cache, &utf8_width_cache, uw1) {
 		RB_REMOVE(utf8_width_cache, &utf8_width_cache, uw);
 		if (uw->allocated)
@@ -551,17 +549,22 @@ utf8_copy(struct utf8_data *to, const struct utf8_data *from)
 
 /* Get width of Unicode character. */
 static enum utf8_state
-utf8_width(struct utf8_data *ud, int *width)
+utf8_width_wc(wchar_t wc, int *width)
 {
 	struct utf8_width_item	*uw;
-	wchar_t			 wc;
+	u_int			 at = (u_int)wc;
 
-	if (utf8_towc(ud, &wc) != UTF8_DONE)
-		return (UTF8_ERROR);
+	if (!log_debug_enabled && at < nitems(utf8_width_memo) &&
+	    utf8_width_memo[at] != 0) {
+		*width = utf8_width_memo[at] - 1;
+		return (UTF8_DONE);
+	}
 	uw = utf8_find_in_width_cache(wc);
 	if (uw != NULL) {
 		*width = uw->width;
 		log_debug("cached width for %08X is %d", (u_int)wc, *width);
+		if (at < nitems(utf8_width_memo) && *width < 255)
+			utf8_width_memo[at] = *width + 1;
 		return (UTF8_DONE);
 	}
 #ifdef HAVE_UTF8PROC
@@ -578,9 +581,112 @@ utf8_width(struct utf8_data *ud, int *width)
 		*width = (wc >= 0x80 && wc <= 0x9f) ? 0 : 1;
 	}
 #endif
-	if (*width >= 0 && *width <= 0xff)
+	if (*width >= 0 && *width <= 0xff) {
+		if (at < nitems(utf8_width_memo) && *width < 255)
+			utf8_width_memo[at] = *width + 1;
 		return (UTF8_DONE);
+	}
 	return (UTF8_ERROR);
+}
+
+static enum utf8_state
+utf8_width(struct utf8_data *ud, int *width)
+{
+	wchar_t wc;
+
+	if (utf8_towc(ud, &wc) != UTF8_DONE)
+		return (UTF8_ERROR);
+	return (utf8_width_wc(wc, width));
+}
+
+/* Decode one complete valid scalar without incremental-parser bookkeeping. */
+enum utf8_state
+utf8_decode(const u_char *data, size_t len, struct utf8_data *ud)
+{
+	u_int cp, size, i;
+	int width;
+
+	if (len == 0)
+		return (UTF8_MORE);
+	if (data[0] >= 0xc2 && data[0] <= 0xdf) {
+		size = 2;
+		cp = data[0] & 0x1f;
+	} else if (data[0] >= 0xe0 && data[0] <= 0xef) {
+		size = 3;
+		cp = data[0] & 0x0f;
+	} else if (data[0] >= 0xf0 && data[0] <= 0xf4) {
+		size = 4;
+		cp = data[0] & 7;
+	} else
+		return (UTF8_ERROR);
+	if (len < size)
+		return (UTF8_MORE);
+	for (i = 1; i < size; i++) {
+		if ((data[i] & 0xc0) != 0x80)
+			return (UTF8_ERROR);
+		cp = (cp << 6)|(data[i] & 0x3f);
+	}
+	if ((size == 3 && cp < 0x800) || (size == 4 && cp < 0x10000) ||
+	    (cp >= 0xd800 && cp <= 0xdfff) || cp > 0x10ffff)
+		return (UTF8_ERROR);
+	memset(ud, 0, sizeof *ud);
+	memcpy(ud->data, data, size);
+	ud->have = ud->size = size;
+#ifdef HAVE_UTF8PROC
+	if (utf8_width_wc(cp, &width) != UTF8_DONE)
+#else
+	if (utf8_width(ud, &width) != UTF8_DONE)
+#endif
+		return (UTF8_ERROR);
+	ud->width = width;
+	return (UTF8_DONE);
+}
+
+/* Decode a scalar which fits directly in the packed two/three-byte form. */
+utf8_char
+utf8_decode_inline(const u_char *data, size_t len, u_int *codepoint)
+{
+	u_int cp, size;
+	utf8_char bytes;
+	int width;
+#ifndef HAVE_UTF8PROC
+	struct utf8_data ud;
+#endif
+
+	if (len < 2 || (data[1] & 0xc0) != 0x80)
+		return (0);
+	if (data[0] >= 0xc2 && data[0] <= 0xdf) {
+		size = 2;
+		cp = ((data[0] & 0x1f) << 6)|(data[1] & 0x3f);
+		bytes = data[0]|((utf8_char)data[1] << 8);
+	} else if (data[0] >= 0xe0 && data[0] <= 0xef) {
+		if (len < 3 || (data[2] & 0xc0) != 0x80)
+			return (0);
+		size = 3;
+		cp = ((data[0] & 0x0f) << 12)|((data[1] & 0x3f) << 6)|
+		    (data[2] & 0x3f);
+		if (cp < 0x800 || (cp >= 0xd800 && cp <= 0xdfff))
+			return (0);
+		bytes = data[0]|((utf8_char)data[1] << 8)|
+		    ((utf8_char)data[2] << 16);
+	} else
+		return (0);
+#ifdef HAVE_UTF8PROC
+	if (!log_debug_enabled && utf8_width_memo[cp] != 0)
+		width = utf8_width_memo[cp] - 1;
+	else if (utf8_width_wc(cp, &width) != UTF8_DONE)
+		return (0);
+#else
+	memset(&ud, 0, sizeof ud);
+	memcpy(ud.data, data, size);
+	ud.size = ud.have = size;
+	if (utf8_width(&ud, &width) != UTF8_DONE)
+		return (0);
+#endif
+	if (width > 2)
+		return (0);
+	*codepoint = cp;
+	return (UTF8_SET_SIZE(size)|UTF8_SET_WIDTH(width)|bytes);
 }
 
 /* Convert UTF-8 character to wide character. */

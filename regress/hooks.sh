@@ -114,8 +114,17 @@ if echo "$shown" | grep -q '\['; then
 	fail "show-hooks showed removed hook: $shown"
 fi
 $TMUX set -g @created 0 || fail "reset @created failed"
+empty_count=$($TMUX show-hooks -gF '#{hook_fire_count}' session-created) ||
+	fail "show empty hook count failed"
 $TMUX new -d -s four || fail "new-session four failed"
 assert_unchanged @created 0
+fired_count=$($TMUX show-hooks -gF '#{hook_fire_count}' session-created) ||
+	fail "show fired empty hook count failed"
+[ "$fired_count" -eq "$((empty_count + 1))" ] ||
+	fail "empty hook did not record its firing: $empty_count -> $fired_count"
+fired_time=$($TMUX show-hooks -gF '#{hook_fire_time}' session-created) ||
+	fail "show empty hook time failed"
+[ -n "$fired_time" ] || fail "empty hook did not record its firing time"
 
 # An unknown hook name is rejected.
 if $TMUX set-hook -g no-such-hook 'display x' 2>/dev/null; then
@@ -132,6 +141,23 @@ assert_unchanged @renamed 0
 $TMUX rename-window -t one:0 onename || fail "rename-window one failed"
 wait_for @renamed 'window-renamed:onename'
 $TMUX set-hook -u -t one window-renamed || fail "set-hook -u failed"
+
+# An explicit empty child array shadows an inherited nonempty hook.
+$TMUX set -g @shadow 0 || fail "set @shadow failed"
+$TMUX set-hook -g window-renamed \
+	'set -gF @shadow "#{hook_window_name}"' ||
+	fail "set global shadow hook failed"
+$TMUX set-hook -t one window-renamed '' || fail "set empty child hook failed"
+$TMUX rename-window -t one:0 shadowed || fail "rename shadowed window failed"
+assert_unchanged @shadow 0
+$TMUX rename-window -t two:0 inherited || fail "rename inherited window failed"
+wait_for @shadow inherited
+$TMUX set-hook -u -t one window-renamed || fail "unset empty child hook failed"
+$TMUX rename-window -t one:0 restored || fail "rename restored window failed"
+wait_for @shadow restored
+$TMUX set-hook -gu window-renamed || fail "unset global shadow hook failed"
+$TMUX rename-window -t one:0 onename || fail "restore window one name failed"
+$TMUX rename-window -t two:0 twoname || fail "restore window two name failed"
 
 # A pane hook only fires for events in that pane.
 pane2=$($TMUX splitw -d -t one:0 -P -F '#{pane_id}') ||

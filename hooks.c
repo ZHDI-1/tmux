@@ -42,6 +42,7 @@ struct hooks_data {
 	const char		*name;
 	struct cmd_find_state	 fs;
 	struct format_tree	*formats;
+	struct event_payload	*event;
 	struct options		*oo;
 	struct client		*client;
 	int			 expand;
@@ -144,6 +145,17 @@ hooks_insert(struct cmdq_item *item, struct hooks_data *hd)
 		return;
 	}
 	options_hook_fired(o);
+	if (*hd->name != '@' && options_array_first(o) == NULL)
+		return;
+
+	/* Event formats are only needed when there are commands to run. */
+	if (hd->event != NULL) {
+		hd->formats = format_create(hd->client, item, FORMAT_NONE,
+		    FORMAT_NOJOBS);
+		event_payload_add_formats(hd->event, hd->formats, "hook_");
+		format_add(hd->formats, "hook", "%s", hd->name);
+		format_log_debug(hd->formats, __func__);
+	}
 
 	if (item == NULL)
 		state = cmdq_new_state(&fs, NULL, CMDQ_STATE_NOHOOKS);
@@ -205,29 +217,25 @@ hooks_insert_event(struct cmdq_item *item, const char *name,
     struct event_payload *ep, struct options *oo, int expand)
 {
 	struct hooks_data	 hd;
-	struct format_tree	*ft;
 	struct client		*c;
 
 	if (item != NULL && (cmdq_get_flags(item) & CMDQ_STATE_NOHOOKS))
 		return;
 
 	c = event_payload_get_client(ep, "client");
-	ft = format_create(c, item, FORMAT_NONE, FORMAT_NOJOBS);
-	event_payload_add_formats(ep, ft, "hook_");
-	format_add(ft, "hook", "%s", name);
-	format_log_debug(ft, __func__);
 
 	memset(&hd, 0, sizeof hd);
 	hd.name = name;
 	cmd_find_clear_state(&hd.fs, 0);
 	event_payload_get_target(ep, &hd.fs);
-	hd.formats = ft;
+	hd.event = ep;
 	hd.oo = oo;
 	hd.client = c;
 	hd.expand = expand;
 
 	hooks_insert(item, &hd);
-	format_free(ft);
+	if (hd.formats != NULL)
+		format_free(hd.formats);
 }
 
 /* Handle an event for hooks. */

@@ -26,8 +26,11 @@
 
 #include "tmux.h"
 
+#undef log_debug
+
 static FILE	*log_file;
 static int	 log_level;
+int		 log_debug_enabled;
 
 /* Log callback for libevent. */
 static void
@@ -65,6 +68,7 @@ log_open(const char *name)
 	free(path);
 	if (log_file == NULL)
 		return;
+	log_debug_enabled = 1;
 
 	setvbuf(log_file, NULL, _IOLBF, 0);
 	event_set_log_callback(log_event_cb);
@@ -89,6 +93,7 @@ log_toggle(const char *name)
 void
 log_close(void)
 {
+	log_debug_enabled = 0;
 	if (log_file != NULL)
 		fclose(log_file);
 	log_file = NULL;

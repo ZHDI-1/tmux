@@ -88,6 +88,7 @@ endif
 
 # List of sources.
 dist_tmux_SOURCES = \
+	pane-io.c \
 	alerts.c \
 	arguments.c \
 	attributes.c \

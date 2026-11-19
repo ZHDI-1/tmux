@@ -167,6 +167,9 @@ void		 image_write(struct screen_write_ctx *, struct image *, u_int,
 void		 image_clear(struct screen_write_ctx *, u_int);
 int		 image_grid_get_at(struct grid *, u_int, u_int, struct image **,
 		     u_int *, u_int *);
+typedef const struct grid_cell *(*image_map_cb)(struct tty *, struct grid *,
+		     u_int, u_int, const struct grid_cell *, struct grid_cell *, int *);
+image_map_cb	 image_prepare_map(struct tty *, struct grid *, u_int);
 const struct grid_cell *image_map_cell(struct tty *, struct grid *, u_int,
 		     u_int, const struct grid_cell *, struct grid_cell *, int *);
 void		 image_draw_line(struct tty *, struct screen *, u_int, u_int,

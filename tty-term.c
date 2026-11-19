@@ -35,6 +35,27 @@ static void	 tty_term_validate(struct tty_term *);
 
 struct tty_terms tty_terms = LIST_HEAD_INITIALIZER(tty_terms);
 
+/* Bounded, per-terminal expansions of the two palette capabilities. */
+struct tty_term_colour_cache {
+	char *values[2][256];
+	int checked[2], enabled[2];
+};
+
+static void
+tty_term_free_colour_cache(struct tty_term *term)
+{
+	u_int i, j;
+
+	if (term->colour_cache == NULL)
+		return;
+	for (i = 0; i < 2; i++) {
+		for (j = 0; j < 256; j++)
+			free(term->colour_cache->values[i][j]);
+	}
+	free(term->colour_cache);
+	term->colour_cache = NULL;
+}
+
 enum tty_code_type {
 	TTYCODE_NONE = 0,
 	TTYCODE_STRING,
@@ -413,6 +434,8 @@ tty_term_apply(struct tty_term *term, const char *capabilities, int quiet,
 			if ((flags & TERM_NOREPLACE) &&
 			    code->type != TTYCODE_NONE)
 				continue;
+			if (i == TTYC_SETAF || i == TTYC_SETAB)
+				tty_term_free_colour_cache(term);
 
 			if (remove) {
 				if (code->type == TTYCODE_STRING)
@@ -707,6 +730,7 @@ tty_term_free(struct tty_term *term)
 	u_int	i;
 
 	log_debug("removing term %s", term->name);
+	tty_term_free_colour_cache(term);
 
 	for (i = 0; i < tty_term_ncodes(); i++) {
 		if (term->codes[i].type == TTYCODE_STRING)
@@ -835,6 +859,28 @@ const char *
 tty_term_string_i(struct tty_term *term, enum tty_code_code code, int a)
 {
 	const char	*x = tty_term_string(term, code), *s;
+	char		**cached = NULL;
+	u_int		 which;
+	struct tty_term_colour_cache *cache;
+
+	if ((code == TTYC_SETAF || code == TTYC_SETAB) &&
+	    a >= 0 && a < 256) {
+		if (term->colour_cache == NULL)
+			term->colour_cache = xcalloc(1, sizeof *term->colour_cache);
+		cache = term->colour_cache;
+		which = code == TTYC_SETAB;
+		if (!cache->checked[which]) {
+			/* Variable reads/writes may carry state between expansions. */
+			cache->enabled[which] = strstr(x, "%P") == NULL &&
+			    strstr(x, "%g") == NULL;
+			cache->checked[which] = 1;
+		}
+		if (cache->enabled[which]) {
+			cached = &cache->values[which][a];
+			if (*cached != NULL)
+				return (*cached);
+		}
+	}
 
 #if defined(HAVE_TIPARM_S)
 	s = tiparm_s(1, 0, x, a);
@@ -846,6 +892,11 @@ tty_term_string_i(struct tty_term *term, enum tty_code_code code, int a)
 	if (s == NULL) {
 		log_debug("could not expand %s", tty_term_codes[code].name);
 		return ("");
+	}
+	/* Large custom capabilities keep the original transient result. */
+	if (cached != NULL && strlen(s) <= 128) {
+		*cached = xstrdup(s);
+		return (*cached);
 	}
 	return (s);
 }

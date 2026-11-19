@@ -29,7 +29,7 @@
 
 static enum cmd_retval	cmd_capture_pane_exec(struct cmd *, struct cmdq_item *);
 
-static char	*cmd_capture_pane_append(char *, size_t *, const char *,
+static char	*cmd_capture_pane_append(char *, size_t *, size_t *, const char *,
 		     size_t);
 static char	*cmd_capture_pane_pending(struct args *, struct window_pane *,
 		     size_t *);
@@ -68,10 +68,26 @@ const struct cmd_entry cmd_clear_history_entry = {
 };
 
 static char *
-cmd_capture_pane_append(char *buf, size_t *len, const char *line,
-    size_t linelen)
+cmd_capture_pane_append(char *buf, size_t *len, size_t *capacity,
+			const char *line, size_t linelen)
 {
-	buf = xrealloc(buf, *len + linelen + 1);
+	size_t need, space;
+
+	if (*len == SIZE_MAX || linelen > SIZE_MAX - *len - 1)
+		fatalx("capture buffer too large");
+	need = *len + linelen + 1;
+	if (need > *capacity) {
+		space = *capacity < 256 ? 256 : *capacity;
+		while (space < need) {
+			if (space > SIZE_MAX / 2) {
+				space = need;
+				break;
+			}
+			space *= 2;
+		}
+		buf = xrealloc(buf, space);
+		*capacity = space;
+	}
 	memcpy(buf + *len, line, linelen);
 	*len += linelen;
 	return (buf);
@@ -80,10 +96,10 @@ cmd_capture_pane_append(char *buf, size_t *len, const char *line,
 static char *
 cmd_capture_pane_cell(struct screen *s, u_int xx, u_int yy)
 {
-	struct grid		*gd = s->grid;
-	struct hyperlinks	*hl = s->hyperlinks;
-	struct grid_cell	 gc;
-	char			*line, *data, *link, *linkid, *f, *b, *u;
+	struct grid *gd = s->grid;
+	struct hyperlinks *hl = s->hyperlinks;
+	struct grid_cell gc;
+	char *line, *data, *link, *linkid, *f, *b, *u;
 	char			 c[UTF8_SIZE + 1];
 	const char		*uri, *iid;
 	u_int			 flags;
@@ -133,6 +149,7 @@ cmd_capture_pane_cell(struct screen *s, u_int xx, u_int yy)
 static char *
 cmd_capture_pane_grid(struct window_pane *wp, size_t *len)
 {
+	size_t capacity = 1;
 	struct screen		*s = &wp->base;
 	struct grid		*gd = s->grid;
 	struct grid_line	*gl;
@@ -143,7 +160,7 @@ cmd_capture_pane_grid(struct window_pane *wp, size_t *len)
 
 	xasprintf(&line, "G %ux%u (%u/%u)\n", gd->sx, gd->sy, gd->hsize,
 	    gd->hlimit);
-	buf = cmd_capture_pane_append(buf, len, line, strlen(line));
+	buf = cmd_capture_pane_append(buf, len, &capacity, line, strlen(line));
 	free(line);
 
 	for (yy = 0; yy < total; yy++) {
@@ -166,12 +183,12 @@ cmd_capture_pane_grid(struct window_pane *wp, size_t *len)
 			    grid_line_flags_string(gl->flags), gl->flags,
 			    gl->cellused, gl->cellsize);
 		}
-		buf = cmd_capture_pane_append(buf, len, line, strlen(line));
+		buf = cmd_capture_pane_append(buf, len, &capacity, line, strlen(line));
 		free(line);
 
 		for (xx = 0; xx < gd->sx; xx++) {
 			line = cmd_capture_pane_cell(s, xx, yy);
-			buf = cmd_capture_pane_append(buf, len, line,
+			buf = cmd_capture_pane_append(buf, len, &capacity, line,
 			    strlen(line));
 			free(line);
 		}
@@ -183,6 +200,7 @@ static char *
 cmd_capture_pane_pending(struct args *args, struct window_pane *wp,
     size_t *len)
 {
+	size_t capacity = 1;
 	struct evbuffer	*pending;
 	char		*buf, *line, tmp[5];
 	size_t		 linelen;
@@ -203,11 +221,11 @@ cmd_capture_pane_pending(struct args *args, struct window_pane *wp,
 				tmp[1] = '\0';
 			} else
 				snprintf(tmp, sizeof tmp, "\\%03hho", line[i]);
-			buf = cmd_capture_pane_append(buf, len, tmp,
+			buf = cmd_capture_pane_append(buf, len, &capacity, tmp,
 			    strlen(tmp));
 		}
 	} else
-		buf = cmd_capture_pane_append(buf, len, line, linelen);
+		buf = cmd_capture_pane_append(buf, len, &capacity, line, linelen);
 	return (buf);
 }
 
@@ -215,6 +233,7 @@ static char *
 cmd_capture_pane_hyperlinks(struct grid *gd, struct screen *s, u_int py,
     u_int *links, u_int *nlinks, size_t *len)
 {
+	size_t capacity = 1;
 	const struct grid_line	*gl = grid_peek_line(gd, py);
 	struct grid_cell	 gc;
 	const char		*uri;
@@ -245,8 +264,8 @@ cmd_capture_pane_hyperlinks(struct grid *gd, struct screen *s, u_int py,
 		links[(*nlinks)++] = gc.link;
 
 		if (*len != 0)
-			line = cmd_capture_pane_append(line, len, " ", 1);
-		line = cmd_capture_pane_append(line, len, uri, strlen(uri));
+			line = cmd_capture_pane_append(line, len, &capacity, " ", 1);
+		line = cmd_capture_pane_append(line, len, &capacity, uri, strlen(uri));
 	}
 	return (line);
 }
@@ -255,6 +274,7 @@ static char *
 cmd_capture_pane_history(struct args *args, struct cmdq_item *item,
     struct window_pane *wp, size_t *len)
 {
+	size_t capacity = 0;
 	struct grid			*gd;
 	const struct grid_line		*gl;
 	struct screen			*s;
@@ -370,13 +390,13 @@ cmd_capture_pane_history(struct args *args, struct cmdq_item *item,
 				n = (int)i - (int)gd->hsize;
 			n = snprintf(b, sizeof b, "%d ", n);
 			if (n >= 0)
-				buf = cmd_capture_pane_append(buf, len, b, n);
+				buf = cmd_capture_pane_append(buf, len, &capacity, b, n);
 		}
 		if (show_time) {
 			n = snprintf(b, sizeof b, "%llu ",
 			    (unsigned long long)grid_line_time(gl));
 			if (n >= 0)
-				buf = cmd_capture_pane_append(buf, len, b, n);
+				buf = cmd_capture_pane_append(buf, len, &capacity, b, n);
 		}
 		if (show_flags) {
 			cp = b;
@@ -398,9 +418,9 @@ cmd_capture_pane_history(struct args *args, struct cmdq_item *item,
 				*cp++ = '-';
 			*cp++ = ' ';
 			*cp = '\0';
-			buf = cmd_capture_pane_append(buf, len, b, strlen (b));
+			buf = cmd_capture_pane_append(buf, len, &capacity, b, strlen (b));
 		}
-		buf = cmd_capture_pane_append(buf, len, line, linelen);
+		buf = cmd_capture_pane_append(buf, len, &capacity, line, linelen);
 
 		if (!join_lines || !(gl->flags & GRID_LINE_WRAPPED))
 			buf[(*len)++] = '\n';

@@ -72,6 +72,7 @@ struct options_array_item;
 struct options_entry;
 struct prompt;
 struct window_pane_prompt;
+struct pane_io;
 struct redraw_damage;
 struct redraw_scene;
 struct redraw_span;
@@ -770,6 +771,10 @@ enum tty_code_code {
 
 /* A single UTF-8 character. */
 typedef u_int utf8_char;
+#define UTF8_GET_SIZE(uc) (((uc) >> 24) & 0x1f)
+#define UTF8_GET_WIDTH(uc) (((uc) >> 29) - 1)
+#define UTF8_SET_SIZE(size) (((utf8_char)(size)) << 24)
+#define UTF8_SET_WIDTH(width) ((((utf8_char)(width)) + 1) << 29)
 
 /*
  * An expanded UTF-8 character. UTF8_SIZE must be big enough to hold combining
@@ -968,7 +973,8 @@ struct grid_line {
 
 	u_short			 cellused;
 	u_short			 cellsize;
-	u_int			 extdsize;
+	u_int			 extdsize;	/* entries in use */
+	u_int			 extdallocated;	/* allocation capacity */
 
 	u_int			 time;
 	struct osc133_data	 osc133_data;
@@ -995,6 +1001,8 @@ struct grid {
 	u_int			 scroll_generation;
 
 	struct grid_line	*linedata;
+	u_int			 lineallocated;
+	struct grid_line	 spare; /* arrays from one discarded line */
 #ifdef ENABLE_IMAGES
 	struct image_store	*images;
 #endif
@@ -1147,6 +1155,8 @@ struct screen {
 	struct screen_sel		*sel;
 
 	struct screen_write_cline	*write_list;
+	u_int				 write_first;
+	u_int				 write_last;
 
 	struct hyperlinks		*hyperlinks;
 	struct progress_bar		 progress_bar;
@@ -1388,7 +1398,9 @@ struct window_pane {
 #define PANE_UTMP 0x800000
 
 	bitstr_t	*sync_dirty;
+	struct screen_write_sync_range *sync_ranges;
 	u_int		 sync_dirty_size;
+	u_int		 sync_dirty_width;
 	u_int		 sync_scrolled;
 	u_int		 sync_rupper;
 	u_int		 sync_rlower;
@@ -1422,6 +1434,8 @@ struct window_pane {
 
 	int		 fd;
 	struct bufferevent *event;
+	struct pane_io	*io;
+	struct evbuffer *input; /* Pane output retained for all consumers. */
 
 	struct window_pane_offset offset;
 	size_t		 base_offset;
@@ -1493,6 +1507,7 @@ struct window {
 
 	struct event		 alerts_timer;
 	struct event		 offset_timer;
+	int			 offset_timer_armed;
 
 	struct timeval		 activity_time;
 	struct timeval		 creation_time;
@@ -1799,6 +1814,7 @@ struct tty_term {
 	char		 acs[UCHAR_MAX + 1][2];
 
 	struct tty_code	*codes;
+	struct tty_term_colour_cache *colour_cache;
 
 #define TERM_256COLOURS 0x1
 #define TERM_NOAM 0x2
@@ -3530,6 +3546,8 @@ void	 input_reset(struct input_ctx *, int);
 struct evbuffer *input_pending(struct input_ctx *);
 void	 input_parse_pane(struct window_pane *);
 void	 input_parse_buffer(struct window_pane *, const u_char *, size_t);
+void	 input_parse_buffers(struct window_pane *, const u_char *, size_t,
+	     const u_char *, size_t);
 void	 input_parse_screen(struct input_ctx *, struct screen *,
 	     screen_write_init_ctx_cb, void *, const u_char *, size_t);
 void	 input_reply(struct input_ctx *, int, const char *,
@@ -3596,14 +3614,19 @@ time_t	 grid_line_time(const struct grid_line *);
 void	 grid_collect_history(struct grid *, int);
 void	 grid_remove_history(struct grid *, u_int );
 void	 grid_scroll_history(struct grid *, u_int);
+void	 grid_scroll_history_lines(struct grid *, const struct grid_cell *,
+	     const char *, size_t, u_int);
 void	 grid_scroll_history_region(struct grid *, u_int, u_int, u_int);
 void	 grid_clear_history(struct grid *);
 const struct grid_line *grid_peek_line(struct grid *, u_int);
 void	 grid_get_cell(struct grid *, u_int, u_int, struct grid_cell *);
+u_char	 grid_get_cell_flags(struct grid *, u_int, u_int);
 void	 grid_set_cell(struct grid *, u_int, u_int, const struct grid_cell *);
 void	 grid_set_padding(struct grid *, u_int, u_int, int);
 void	 grid_set_cells(struct grid *, u_int, u_int, const struct grid_cell *,
 	     const char *, size_t);
+void	 grid_set_utf8_cells(struct grid *, u_int, u_int,
+	     const struct grid_cell *, const utf8_char *, u_int, u_int);
 struct grid_line *grid_get_line(struct grid *, u_int);
 void	 grid_adjust_lines(struct grid *, u_int);
 void	 grid_clear(struct grid *, u_int, u_int, u_int, u_int, u_int);
@@ -3720,6 +3743,7 @@ void	 screen_write_clearline(struct screen_write_ctx *, u_int);
 void	 screen_write_clearendofline(struct screen_write_ctx *, u_int);
 void	 screen_write_clearstartofline(struct screen_write_ctx *, u_int);
 void	 screen_write_cursormove(struct screen_write_ctx *, int, int, int);
+void	 screen_write_collect_cursormove(struct screen_write_ctx *, int, int, int);
 void	 screen_write_reverseindex(struct screen_write_ctx *, u_int);
 void	 screen_write_scrollregion(struct screen_write_ctx *, u_int, u_int);
 void	 screen_write_linefeed(struct screen_write_ctx *, int, u_int);
@@ -3732,6 +3756,12 @@ void	 screen_write_clearscreen(struct screen_write_ctx *, u_int);
 void	 screen_write_clearhistory(struct screen_write_ctx *);
 void	 screen_write_fullredraw(struct screen_write_ctx *);
 void	 screen_write_collect_end(struct screen_write_ctx *);
+int	 screen_write_collect_lines(struct screen_write_ctx *,
+	     const struct grid_cell *, const u_char *, size_t, u_int, int);
+int	 screen_write_collect_add_utf8(struct screen_write_ctx *,
+	     const struct grid_cell *, const utf8_char *, u_int, u_int);
+size_t	 screen_write_collect_add_ascii(struct screen_write_ctx *,
+	     const struct grid_cell *, const u_char *, size_t);
 void	 screen_write_collect_add(struct screen_write_ctx *,
 	     const struct grid_cell *);
 void	 screen_write_cell(struct screen_write_ctx *, const struct grid_cell *);
@@ -3816,6 +3846,13 @@ struct window	*window_find_by_id(u_int);
 void		 window_update_activity(struct window *);
 struct window	*window_create(u_int, u_int, u_int, u_int);
 void		 window_pane_set_event(struct window_pane *);
+void		 window_pane_io_data(struct window_pane *, const u_char *, size_t,
+		     const u_char *, size_t);
+void		 window_pane_io_eof(struct window_pane *);
+int		 pane_io_start(struct window_pane *);
+void		 pane_io_destroy(struct window_pane *);
+void		 pane_io_set_read(struct window_pane *, int);
+int		 pane_io_finished(struct window_pane *);
 void		 window_pane_utmp_add(struct window_pane *);
 void		 window_pane_utmp_remove(struct window_pane *);
 void		 window_pane_wait_finish(struct window_pane *);
@@ -4226,6 +4263,8 @@ void		 utf8_set(struct utf8_data *, u_char);
 void		 utf8_copy(struct utf8_data *, const struct utf8_data *);
 enum utf8_state	 utf8_open(struct utf8_data *, u_char);
 enum utf8_state	 utf8_append(struct utf8_data *, u_char);
+enum utf8_state	 utf8_decode(const u_char *, size_t, struct utf8_data *);
+utf8_char	 utf8_decode_inline(const u_char *, size_t, u_int *);
 int		 utf8_isvalid(const char *);
 size_t		 utf8_strvis(char *, const char *, size_t, int);
 size_t		 utf8_stravis(char **, const char *, int);
@@ -4256,12 +4295,17 @@ enum hanguljamo_state hanguljamo_check_state(const struct utf8_data *,
 		    const struct utf8_data *);
 
 /* log.c */
+extern int log_debug_enabled;
 void	log_add_level(void);
 int	log_get_level(void);
 void	log_open(const char *);
 void	log_toggle(const char *);
 void	log_close(void);
 void printflike(1, 2) log_debug(const char *, ...);
+#define log_debug(...) do { \
+	if (log_debug_enabled) \
+		log_debug(__VA_ARGS__); \
+} while (0)
 __dead void printflike(1, 2) fatal(const char *, ...);
 __dead void printflike(1, 2) fatalx(const char *, ...);
 

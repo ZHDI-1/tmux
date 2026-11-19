@@ -559,8 +559,7 @@ window_copy_sync_backing(struct window_mode_entry *wme)
 
 		/* Resize linedata to the new history plus viewport. */
 		if (new_hsize + sy != old_hsize + sy - collected) {
-			dg->linedata = xreallocarray(dg->linedata,
-			    new_hsize + sy, sizeof *dg->linedata);
+			grid_adjust_lines(dg, new_hsize + sy);
 			memset(&dg->linedata[old_hsize + sy - collected], 0,
 			    (new_hsize - kept) * sizeof *dg->linedata);
 		}

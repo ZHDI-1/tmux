@@ -491,7 +491,53 @@ format_job_tidy(struct format_job_tree *jobs, int force)
 static size_t
 format_strftime(char *s, size_t max, const char *fmt, const struct tm *tm)
 {
-	return (strftime(s, max, fmt, tm));
+	const char	*next, *end;
+	char		*escaped, *out, probe[5], value[128];
+	size_t		 len, result;
+	u_int		 i;
+
+	result = strftime(s, max, fmt, tm);
+	if (result != 0 || *fmt == '\0')
+		return (result);
+
+	/* Some libcs reject literal or unknown percent sequences. These
+	 * occur in tmux expressions and pane IDs, including during nested
+	 * time expansion. Preserve them while keeping supported directives.
+	 * Probe without a field width so an oversized valid directive still
+	 * fails the final bounded strftime call rather than becoming text. */
+	len = strlen(fmt);
+	if (len > (SIZE_MAX - 1) / 2)
+		return (0);
+	out = escaped = xmalloc(2 * len + 1);
+	for (next = fmt; *next != '\0';) {
+		if (*next == '%') {
+			end = next + 1;
+			while (*end != '\0' &&
+			    (strchr("-_0^#+", *end) != NULL ||
+			    isdigit((u_char)*end)))
+				end++;
+			probe[0] = 'x'; /* Also distinguish valid empty expansions. */
+			probe[1] = '%';
+			i = 2;
+			if (*end == 'E' || *end == 'O')
+				probe[i++] = *end++;
+			if (*end != '\0') {
+				probe[i++] = *end;
+				probe[i] = '\0';
+				if (strftime(value, sizeof value, probe, tm) != 0) {
+					while (next <= end)
+						*out++ = *next++;
+					continue;
+				}
+			}
+			*out++ = '%';
+		}
+		*out++ = *next++;
+	}
+	*out = '\0';
+	result = strftime(s, max, escaped, tm);
+	free(escaped);
+	return (result);
 }
 #ifdef __GNUC__
 #pragma GCC diagnostic pop
@@ -1011,8 +1057,10 @@ format_cb_history_bytes(struct format_tree *ft)
 	for (i = 0; i < gd->hsize + gd->sy; i++) {
 		gl = grid_get_line(gd, i);
 		size += gl->cellsize * sizeof *gl->celldata;
-		size += gl->extdsize * sizeof *gl->extddata;
+		size += gl->extdallocated * sizeof *gl->extddata;
 	}
+	size += gd->spare.cellsize * sizeof *gl->celldata;
+	size += gd->spare.extdallocated * sizeof *gl->extddata;
 	size += (gd->hsize + gd->sy) * sizeof *gl;
 
 	xasprintf(&value, "%zu", size);
@@ -1037,9 +1085,11 @@ format_cb_history_all_bytes(struct format_tree *ft)
 	for (i = 0; i < lines; i++) {
 		gl = grid_get_line(gd, i);
 		cells += gl->cellsize;
-		extended_cells += gl->extdsize;
+		extended_cells += gl->extdallocated;
 	}
 
+	cells += gd->spare.cellsize;
+	extended_cells += gd->spare.extdallocated;
 	xasprintf(&value, "%u,%zu,%u,%zu,%u,%zu", lines,
 	    lines * sizeof *gl, cells, cells * sizeof *gl->celldata,
 	    extended_cells, extended_cells * sizeof *gl->extddata);
@@ -4760,8 +4810,14 @@ found:
 			if (time_format != NULL) {
 				if (localtime_r(&t, &tm) == NULL)
 					return (NULL);
-				format_strftime(s, sizeof s, time_format, &tm);
+				if (format_strftime(s, sizeof s, time_format, &tm) == 0)
+					return (NULL);
 			} else {
+				/* ctime_r has only room for a four-digit year. Some
+				 * libcs abort rather than returning NULL on overflow. */
+				if (localtime_r(&t, &tm) == NULL ||
+				    tm.tm_year < -1900 || tm.tm_year > 8099)
+					return (NULL);
 				if (ctime_r(&t, s) == NULL)
 					return (NULL);
 				s[strcspn(s, "\n")] = '\0';

@@ -103,9 +103,22 @@ static void
 grid_get_extended_cell(struct grid_line *gl, struct grid_cell_entry *gce,
     int flags)
 {
-	u_int at = gl->extdsize + 1;
+	u_int at, space;
 
-	gl->extddata = xreallocarray(gl->extddata, at, sizeof *gl->extddata);
+	if (gl->extdsize == UINT_MAX)
+		fatalx("too many extended cells");
+	at = gl->extdsize + 1;
+	if (at > gl->extdallocated) {
+		if (gl->extdallocated < 16)
+			space = 16;
+		else if (gl->extdallocated > UINT_MAX / 2)
+			space = UINT_MAX;
+		else
+			space = gl->extdallocated * 2;
+		gl->extddata = xpool_reallocarray(gl->extddata, space,
+		    sizeof *gl->extddata);
+		gl->extdallocated = space;
+	}
 	gl->extdsize = at;
 
 	gce->offset = at - 1;
@@ -165,12 +178,13 @@ grid_compact_line(struct grid_line *gl)
 	}
 
 	if (new_extdsize == 0) {
-		free(gl->extddata);
+		xpool_free(gl->extddata);
 		gl->extddata = NULL;
 		gl->extdsize = 0;
+		gl->extdallocated = 0;
 		return;
 	}
-	new_extddata = xreallocarray(NULL, new_extdsize, sizeof *gl->extddata);
+	new_extddata = xpool_reallocarray(NULL, new_extdsize, sizeof *gl->extddata);
 
 	idx = 0;
 	for (px = 0; px < gl->cellsize; px++) {
@@ -182,9 +196,10 @@ grid_compact_line(struct grid_line *gl)
 		}
 	}
 
-	free(gl->extddata);
+	xpool_free(gl->extddata);
 	gl->extddata = new_extddata;
 	gl->extdsize = new_extdsize;
+	gl->extdallocated = new_extdsize;
 }
 
 /* Get line data. */
@@ -217,7 +232,27 @@ grid_line_set_time(struct grid_line *gl)
 void
 grid_adjust_lines(struct grid *gd, u_int lines)
 {
-	gd->linedata = xreallocarray(gd->linedata, lines, sizeof *gd->linedata);
+	u_int space;
+
+	/* Keep append and reflow growth amortized, but release large shrinks. */
+	if (lines <= gd->lineallocated) {
+		if (lines >= gd->lineallocated / 4)
+			return;
+		space = lines;
+	} else {
+		space = gd->lineallocated;
+		if (space < 64)
+			space = 64;
+		while (space < lines) {
+			if (space > UINT_MAX / 2) {
+				space = lines;
+				break;
+			}
+			space *= 2;
+		}
+	}
+	gd->linedata = xreallocarray(gd->linedata, space, sizeof *gd->linedata);
+	gd->lineallocated = space;
 }
 
 /* Copy default into a cell. */
@@ -311,8 +346,8 @@ grid_free_line(struct grid *gd, u_int py)
 #ifdef ENABLE_IMAGES
 	image_grid_free_line(gd, gl);
 #endif
-	free(gl->celldata);
-	free(gl->extddata);
+	xpool_free(gl->celldata);
+	xpool_free(gl->extddata);
 	memset(gl, 0, sizeof *gl);
 }
 
@@ -342,6 +377,7 @@ grid_create(u_int sx, u_int sy, u_int hlimit)
 
 	if (gd->sy != 0)
 		gd->linedata = xcalloc(gd->sy, sizeof *gd->linedata);
+	gd->lineallocated = gd->sy;
 	return (gd);
 }
 
@@ -350,6 +386,8 @@ void
 grid_destroy(struct grid *gd)
 {
 	grid_free_lines(gd, 0, gd->hsize + gd->sy);
+	xpool_free(gd->spare.celldata);
+	xpool_free(gd->spare.extddata);
 #ifdef ENABLE_IMAGES
 	image_grid_free(gd);
 #endif
@@ -455,8 +493,7 @@ grid_scroll_history(struct grid *gd, u_int bg)
 	u_int	yy;
 
 	yy = gd->hsize + gd->sy;
-	gd->linedata = xreallocarray(gd->linedata, yy + 1,
-	    sizeof *gd->linedata);
+	grid_adjust_lines(gd, yy + 1);
 	grid_empty_line(gd, yy, bg);
 
 	gd->hscrolled++;
@@ -464,6 +501,137 @@ grid_scroll_history(struct grid *gd, u_int bg)
 	grid_line_set_time(&gd->linedata[gd->hsize]);
 	gd->hsize++;
 	gd->scroll_added++;
+}
+
+/* Copy a complete line template, reusing storage from a discarded line. */
+static void
+grid_reuse_line(struct grid_line *dst, const struct grid_line *src,
+    struct grid_line *old)
+{
+	struct grid_cell_entry	*cells = old->celldata;
+	struct grid_extd_entry	*extended = old->extddata;
+	size_t			 size;
+	int			 same;
+
+	if (src->cellsize == 0) {
+		xpool_free(cells);
+		cells = NULL;
+	} else {
+		same = old->cellsize == src->cellsize;
+		if (!same)
+			cells = xpool_reallocarray(cells, src->cellsize, sizeof *cells);
+		size = src->cellsize * sizeof *cells;
+		if (!same || memcmp(cells, src->celldata, size) != 0)
+			memcpy(cells, src->celldata, size);
+	}
+	if (src->extdsize == 0) {
+		xpool_free(extended);
+		extended = NULL;
+	} else {
+		same = old->extdallocated == src->extdsize;
+		if (!same)
+			extended = xpool_reallocarray(extended, src->extdsize,
+			    sizeof *extended);
+		size = src->extdsize * sizeof *extended;
+		if (!same || old->extdsize != src->extdsize ||
+		    memcmp(extended, src->extddata, size) != 0)
+			memcpy(extended, src->extddata, size);
+	}
+	memcpy(dst, src, sizeof *dst);
+	dst->celldata = cells;
+	dst->extddata = extended;
+	dst->extdallocated = src->extdsize;
+}
+
+/*
+ * Scroll repeated complete lines into history. The caller has written the
+ * first line at the bottom already. Simulate collection counters exactly,
+ * retain old rows, and reuse storage from rows which the normal 10% history
+ * collection would discard. Only the final retained new rows are materialized.
+ */
+void
+grid_scroll_history_lines(struct grid *gd, const struct grid_cell *gc,
+    const char *line, size_t len, u_int lines)
+{
+	struct grid		 template;
+	struct grid_line		 text, blank, *pool = NULL, *old, empty = { 0 };
+	struct grid_cell		 cell;
+	u_int			 old_hsize = gd->hsize;
+	u_int			 old_size = gd->hsize + gd->sy, hsize = gd->hsize;
+	u_int			 hscrolled = gd->hscrolled, collected = 0;
+	u_int			 n, i, drop, remaining, pool_size, size, first;
+
+	for (i = 0; i < lines; i++) {
+		if (hsize != 0 && hsize >= gd->hlimit) {
+			n = gd->hlimit / 10;
+			if (n == 0)
+				n = 1;
+			if (n > hsize)
+				n = hsize;
+			hsize -= n;
+			collected += n;
+			if (hscrolled > hsize)
+				hscrolled = hsize;
+		}
+		hsize++;
+		hscrolled++;
+	}
+
+	memset(&template, 0, sizeof template);
+	memset(&text, 0, sizeof text);
+	memset(&blank, 0, sizeof blank);
+	template.sx = gd->sx;
+	template.sy = 1;
+	template.linedata = &text;
+	grid_empty_line(&template, 0, gc->bg);
+	memcpy(&cell, gc, sizeof cell);
+	utf8_set(&cell.data, ' ');
+	grid_set_cells(&template, 0, 0, &cell, line, len);
+	grid_compact_line(&text);
+	template.linedata = &blank;
+	grid_empty_line(&template, 0, gc->bg);
+	grid_compact_line(&blank);
+
+	drop = collected < old_size ? collected : old_size;
+	if (drop != 0) {
+		pool = xreallocarray(NULL, drop, sizeof *pool);
+		memcpy(pool, gd->linedata, drop * sizeof *pool);
+	}
+	remaining = old_size - drop;
+	memmove(gd->linedata, gd->linedata + drop,
+	    remaining * sizeof *gd->linedata);
+	size = hsize + gd->sy;
+	grid_adjust_lines(gd, size);
+	memset(gd->linedata + remaining, 0,
+	    (size - remaining) * sizeof *gd->linedata);
+	gd->hsize = hsize;
+	gd->hscrolled = hscrolled;
+	gd->scroll_added += lines;
+	gd->scroll_collected += collected;
+
+	/* Surviving original viewport rows have now entered the history. */
+	first = old_hsize > drop ? old_hsize - drop : 0;
+	for (i = first; i < remaining; i++) {
+		grid_compact_line(&gd->linedata[i]);
+		grid_line_set_time(&gd->linedata[i]);
+	}
+	pool_size = drop;
+	for (i = remaining; i < size; i++) {
+		old = pool_size != 0 ? &pool[--pool_size] : &empty;
+		grid_reuse_line(&gd->linedata[i], i == size - 1 ? &blank : &text,
+		    old);
+		if (i < hsize)
+			grid_line_set_time(&gd->linedata[i]);
+	}
+	for (i = 0; i < pool_size; i++) {
+		xpool_free(pool[i].celldata);
+		xpool_free(pool[i].extddata);
+	}
+	free(pool);
+	xpool_free(text.celldata);
+	xpool_free(text.extddata);
+	xpool_free(blank.celldata);
+	xpool_free(blank.extddata);
 }
 
 /* Clear the history. */
@@ -476,8 +644,7 @@ grid_clear_history(struct grid *gd)
 	gd->hsize = 0;
 	gd->scroll_generation++;
 
-	gd->linedata = xreallocarray(gd->linedata, gd->sy,
-	    sizeof *gd->linedata);
+	grid_adjust_lines(gd, gd->sy);
 }
 
 /* Scroll a region up, moving the top line into the history. */
@@ -489,8 +656,7 @@ grid_scroll_history_region(struct grid *gd, u_int upper, u_int lower, u_int bg)
 
 	/* Create a space for a new line. */
 	yy = gd->hsize + gd->sy;
-	gd->linedata = xreallocarray(gd->linedata, yy + 1,
-	    sizeof *gd->linedata);
+	grid_adjust_lines(gd, yy + 1);
 
 	/* Move the entire screen down to free a space for this line. */
 	gl_history = &gd->linedata[gd->hsize];
@@ -515,32 +681,111 @@ grid_scroll_history_region(struct grid *gd, u_int upper, u_int lower, u_int bg)
 	gd->scroll_added++;
 }
 
+/* Initialize newly allocated columns with an extended background colour. */
+static void
+grid_fill_new_rgb(struct grid_cell_entry *restrict cells,
+    struct grid_extd_entry *restrict entries, u_int offset, u_int n, u_int bg)
+{
+	struct grid_extd_entry	 clear;
+	u_int			 i;
+	uint64_t		 first, middle, last;
+
+	clear.data = utf8_build_one(' ');
+	clear.attr = 0;
+	clear.flags = 0;
+	clear.fg = 8;
+	clear.bg = bg;
+	clear.us = 8;
+	clear.link = 0;
+	/*
+	 * Fixed-size copies let the compiler use wide stores without unaligned
+	 * casts. The tail overlaps the middle to stay within the packed entry.
+	 */
+	if (sizeof clear >= 16 && sizeof clear <= 24) {
+		memcpy(&first, &clear, sizeof first);
+		memcpy(&middle, (const char *)&clear + 8, sizeof middle);
+		memcpy(&last, (const char *)&clear + sizeof clear - 8, sizeof last);
+		for (i = 0; i < n; i++, cells++, entries++) {
+			cells->offset = offset + i;
+			cells->flags = GRID_FLAG_CLEARED|GRID_FLAG_EXTENDED;
+			memcpy(entries, &first, sizeof first);
+			memcpy((char *)entries + 8, &middle, sizeof middle);
+			memcpy((char *)entries + sizeof clear - 8, &last, sizeof last);
+		}
+	} else {
+		for (i = 0; i < n; i++, cells++, entries++) {
+			cells->offset = offset + i;
+			cells->flags = GRID_FLAG_CLEARED|GRID_FLAG_EXTENDED;
+			*entries = clear;
+		}
+	}
+}
+
+/* Apply the existing quarter/half/full row-allocation policy. */
+static u_int
+grid_line_size(struct grid *gd, u_int sx)
+{
+	if (sx < gd->sx / 4)
+		return (gd->sx / 4);
+	if (sx < gd->sx / 2)
+		return (gd->sx / 2);
+	if (gd->sx > sx)
+		return (gd->sx);
+	return (sx);
+}
+
 /* Expand line to fit to cell. */
 static void
 grid_expand_line(struct grid *gd, u_int py, u_int sx, u_int bg)
 {
 	struct grid_line	*gl;
-	u_int			 xx;
+	struct grid_cell_entry clear;
+	u_int			 xx, space;
 
 	gl = &gd->linedata[py];
 	if (sx <= gl->cellsize)
 		return;
 
-	if (sx < gd->sx / 4)
-		sx = gd->sx / 4;
-	else if (sx < gd->sx / 2)
-		sx = gd->sx / 2;
-	else if (gd->sx > sx)
-		sx = gd->sx;
+	sx = grid_line_size(gd, sx);
 
-	gl->celldata = xreallocarray(gl->celldata, sx,
-	    sizeof *gl->celldata);
-	if (gl->cellsize < sx) {
-		memset(gl->celldata + gl->cellsize, 0,
-		    (sx - gl->cellsize) * sizeof *gl->celldata);
+	/* The spare owns only arrays; a new row keeps its own metadata. */
+	if (gl->cellsize == 0 && gl->celldata == NULL &&
+	    gl->extddata == NULL && gd->spare.celldata != NULL) {
+		gl->celldata = gd->spare.celldata;
+		gl->extddata = gd->spare.extddata;
+		gl->extdallocated = gd->spare.extdallocated;
+		if (gd->spare.cellsize != sx)
+			gl->celldata = xpool_reallocarray(gl->celldata, sx,
+			    sizeof *gl->celldata);
+		memset(&gd->spare, 0, sizeof gd->spare);
+	} else
+		gl->celldata = xpool_reallocarray(gl->celldata, sx,
+		    sizeof *gl->celldata);
+
+	/* RGB background clears need one extended entry per new column. */
+	if (bg & (COLOUR_FLAG_RGB|COLOUR_FLAG_THEME)) {
+		if (gl->extdsize > UINT_MAX - (sx - gl->cellsize))
+			fatalx("too many extended cells");
+		space = gl->extdsize + sx - gl->cellsize;
+		if (space > gl->extdallocated) {
+			gl->extddata = xpool_reallocarray(gl->extddata, space,
+			    sizeof *gl->extddata);
+			gl->extdallocated = space;
+		}
+		grid_fill_new_rgb(gl->celldata + gl->cellsize,
+		    gl->extddata + gl->extdsize, gl->extdsize,
+		    sx - gl->cellsize, bg);
+		gl->extdsize += sx - gl->cellsize;
+		gl->flags |= GRID_LINE_EXTENDED;
+	} else {
+		/* New columns have no extended storage to preserve. */
+		clear = grid_cleared_entry;
+		clear.data.bg = bg;
+		if (bg & COLOUR_FLAG_256)
+			clear.flags |= GRID_FLAG_BG256;
+		for (xx = gl->cellsize; xx < sx; xx++)
+			gl->celldata[xx] = clear;
 	}
-	for (xx = gl->cellsize; xx < sx; xx++)
-		grid_clear_cell(gd, xx, py, bg, 0);
 	gl->cellsize = sx;
 }
 
@@ -616,6 +861,30 @@ grid_get_cell(struct grid *gd, u_int px, u_int py, struct grid_cell *gc)
 		grid_get_cell1(&gd->linedata[py], px, gc);
 }
 
+/* Get flags without decoding the cell's character and attributes. */
+u_char
+grid_get_cell_flags(struct grid *gd, u_int px, u_int py)
+{
+	struct grid_line		*gl;
+	struct grid_cell_entry	*gce;
+	u_char			 flags;
+
+	if (grid_check_y(gd, __func__, py) != 0)
+		return (grid_default_cell.flags);
+	gl = &gd->linedata[py];
+	if (px >= gl->cellsize)
+		return (grid_default_cell.flags);
+	gce = &gl->celldata[px];
+	if (~gce->flags & GRID_FLAG_EXTENDED)
+		return (gce->flags & ~(GRID_FLAG_FG256|GRID_FLAG_BG256));
+	if (gce->offset >= gl->extdsize)
+		return (grid_default_cell.flags);
+	flags = gl->extddata[gce->offset].flags;
+	if (flags & GRID_FLAG_TAB)
+		flags &= ~GRID_FLAG_PADDING;
+	return (flags);
+}
+
 /* Set cell at position. */
 void
 grid_set_cell(struct grid *gd, u_int px, u_int py, const struct grid_cell *gc)
@@ -657,8 +926,10 @@ grid_set_cells(struct grid *gd, u_int px, u_int py, const struct grid_cell *gc,
 {
 	struct grid_line	*gl;
 	struct grid_cell_entry	*gce;
-	struct grid_extd_entry	*gee;
+	struct grid_extd_entry	*gee, entry;
+	struct grid_cell_entry	 empty = { 0 };
 	u_int			 i;
+	utf8_char		 ascii;
 
 	if (grid_check_y(gd, __func__, py) != 0)
 		return;
@@ -669,14 +940,131 @@ grid_set_cells(struct grid *gd, u_int px, u_int py, const struct grid_cell *gc,
 	if (px + slen > gl->cellused)
 		gl->cellused = px + slen;
 
+	/* Every character in this run has the same extended attributes. */
+	if (slen != 0 && grid_need_extended_cell(&empty, gc)) {
+		ascii = utf8_build_one(0);
+		entry.attr = gc->attr;
+		entry.flags = gc->flags & ~GRID_FLAG_CLEARED;
+		entry.fg = gc->fg;
+		entry.bg = gc->bg;
+		entry.us = gc->us;
+		entry.link = gc->link;
+		for (i = 0; i < slen; i++) {
+			gce = &gl->celldata[px + i];
+			if (~gce->flags & GRID_FLAG_EXTENDED)
+				grid_get_extended_cell(gl, gce, entry.flags);
+			else if (gce->offset >= gl->extdsize)
+				fatalx("offset too big");
+			entry.data = ascii | (u_char)s[i];
+			gl->extddata[gce->offset] = entry;
+		}
+		gl->flags |= GRID_LINE_EXTENDED;
+		if (gc->link != 0)
+			gl->flags |= GRID_LINE_HYPERLINK;
+		return;
+	}
+
 	for (i = 0; i < slen; i++) {
 		gce = &gl->celldata[px + i];
-		if (grid_need_extended_cell(gce, gc)) {
+		if (gce->flags & GRID_FLAG_EXTENDED) {
 			gee = grid_extended_cell(gl, gce, gc);
 			gee->data = utf8_build_one(s[i]);
 		} else
 			grid_store_cell(gce, gc, s[i]);
 	}
+}
+
+/* Store an ordinary UTF-8 run with a shared style and explicit wide padding. */
+void
+grid_set_utf8_cells(struct grid *gd, u_int px, u_int py,
+    const struct grid_cell *gc, const utf8_char *data, u_int n,
+    u_int width)
+{
+	struct grid_line		*gl;
+	struct grid_cell_entry	*gce, compact_padding;
+	struct grid_extd_entry	 entry, padding;
+	struct grid_cell		 padding_cell;
+	u_int			 i, x, need = 0, space, capacity, request = 0;
+	int			 extended_padding;
+	utf8_char		 padding_data;
+
+	if (n == 0 || grid_check_y(gd, __func__, py) != 0)
+		return;
+	gl = &gd->linedata[py];
+	/* Match scalar growth boundaries: an exact quarter/half may already
+	 * fit a preceding allocation and must not expose extra cleared cells. */
+	capacity = gl->cellsize;
+	for (i = 0, x = px; i < n; i++) {
+		x += UTF8_GET_WIDTH(data[i]);
+		if (x > capacity) {
+			request = x;
+			capacity = grid_line_size(gd, x);
+		}
+	}
+	if (request != 0)
+		grid_expand_line(gd, py, request, 8);
+	if (px + width > gl->cellused)
+		gl->cellused = px + width;
+	extended_padding = gc->bg & (COLOUR_FLAG_RGB|COLOUR_FLAG_THEME);
+	for (i = 0, x = px; i < n; i++) {
+		if (~gl->celldata[x].flags & GRID_FLAG_EXTENDED)
+			need++;
+		if (UTF8_GET_WIDTH(data[i]) == 2 && extended_padding &&
+		    (~gl->celldata[x + 1].flags & GRID_FLAG_EXTENDED))
+			need++;
+		x += UTF8_GET_WIDTH(data[i]);
+	}
+	if (need > UINT_MAX - gl->extdsize)
+		fatalx("too many extended cells");
+	space = gl->extdsize + need;
+	if (space > gl->extdallocated) {
+		gl->extddata = xpool_reallocarray(gl->extddata, space,
+		    sizeof *gl->extddata);
+		gl->extdallocated = space;
+	}
+	entry.attr = gc->attr;
+	entry.flags = gc->flags & ~GRID_FLAG_CLEARED;
+	entry.fg = gc->fg;
+	entry.bg = gc->bg;
+	entry.us = gc->us;
+	entry.link = gc->link;
+	memcpy(&padding_cell, &grid_padding_cell, sizeof padding_cell);
+	padding_cell.bg = gc->bg;
+	grid_store_cell(&compact_padding, &padding_cell, '!');
+	utf8_from_data(&padding_cell.data, &padding_data);
+	padding.data = padding_data;
+	padding.attr = 0;
+	padding.flags = GRID_FLAG_PADDING;
+	padding.fg = 8;
+	padding.bg = gc->bg;
+	padding.us = 8;
+	padding.link = 0;
+	for (i = 0, x = px; i < n; i++) {
+		if (UTF8_GET_WIDTH(data[i]) == 2) {
+			gce = &gl->celldata[x + 1];
+			if (extended_padding || (gce->flags & GRID_FLAG_EXTENDED)) {
+				if (~gce->flags & GRID_FLAG_EXTENDED) {
+					gce->offset = gl->extdsize++;
+					gce->flags = GRID_FLAG_EXTENDED|GRID_FLAG_PADDING;
+				} else if (gce->offset >= gl->extdsize)
+					fatalx("offset too big");
+				gl->extddata[gce->offset] = padding;
+			} else
+				*gce = compact_padding;
+		}
+		gce = &gl->celldata[x];
+		if (~gce->flags & GRID_FLAG_EXTENDED) {
+			gce->offset = gl->extdsize++;
+			gce->flags = GRID_FLAG_EXTENDED|entry.flags;
+		} else if (gce->offset >= gl->extdsize)
+			fatalx("offset too big");
+		entry.data = data[i];
+		gl->extddata[gce->offset] = entry;
+		x += UTF8_GET_WIDTH(data[i]);
+	}
+	gl->flags |= GRID_LINE_EXTENDED;
+	if (gc->link != 0)
+		gl->flags |= GRID_LINE_HYPERLINK;
 }
 
 /* Clear area. */
@@ -777,7 +1165,18 @@ grid_move_lines(struct grid *gd, u_int dy, u_int py, u_int ny, u_int bg)
 	for (yy = dy; yy < dy + ny; yy++) {
 		if (yy >= py && yy < py + ny)
 			continue;
-		grid_free_line(gd, yy);
+		/* Retain at most one discarded row's arrays, with unique ownership. */
+#ifdef ENABLE_IMAGES
+		if (gd->images == NULL && gd->linedata[yy].cellsize != 0) {
+#else
+		if (gd->linedata[yy].cellsize != 0) {
+#endif
+			xpool_free(gd->spare.celldata);
+			xpool_free(gd->spare.extddata);
+			gd->spare = gd->linedata[yy];
+			memset(&gd->linedata[yy], 0, sizeof gd->linedata[yy]);
+		} else
+			grid_free_line(gd, yy);
 	}
 	if (dy != 0)
 		gd->linedata[dy - 1].flags &= ~GRID_LINE_WRAPPED;
@@ -1275,7 +1674,7 @@ grid_duplicate_lines(struct grid *dst, u_int dy, struct grid *src, u_int sy,
 		dstl->images = NULL;
 #endif
 		if (srcl->cellsize != 0) {
-			dstl->celldata = xreallocarray(NULL,
+			dstl->celldata = xpool_reallocarray(NULL,
 			    srcl->cellsize, sizeof *dstl->celldata);
 			memcpy(dstl->celldata, srcl->celldata,
 			    srcl->cellsize * sizeof *dstl->celldata);
@@ -1283,12 +1682,13 @@ grid_duplicate_lines(struct grid *dst, u_int dy, struct grid *src, u_int sy,
 			dstl->celldata = NULL;
 		if (srcl->extdsize != 0) {
 			dstl->extdsize = srcl->extdsize;
-			dstl->extddata = xreallocarray(NULL, dstl->extdsize,
+			dstl->extddata = xpool_reallocarray(NULL, dstl->extdsize,
 			    sizeof *dstl->extddata);
 			memcpy(dstl->extddata, srcl->extddata, dstl->extdsize *
 			    sizeof *dstl->extddata);
 		} else
 			dstl->extddata = NULL;
+		dstl->extdallocated = dstl->extdsize;
 
 		sy++;
 		dy++;
@@ -1313,7 +1713,7 @@ grid_reflow_add(struct grid *gd, u_int n)
 	struct grid_line	*gl;
 	u_int			 sy = gd->sy + n;
 
-	gd->linedata = xreallocarray(gd->linedata, sy, sizeof *gd->linedata);
+	grid_adjust_lines(gd, sy);
 	gl = &gd->linedata[gd->sy];
 	memset(gl, 0, n * (sizeof *gl));
 	gd->sy = sy;
@@ -1664,6 +2064,7 @@ grid_reflow(struct grid *gd, u_int sx)
 		gd->hscrolled = gd->hsize;
 	free(gd->linedata);
 	gd->linedata = target->linedata;
+	gd->lineallocated = target->lineallocated;
 	free(target);
 	gd->scroll_generation++;
 }

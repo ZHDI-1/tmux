@@ -2088,7 +2088,7 @@ server_client_check_pane_resize(struct window_pane *wp)
 static void
 server_client_check_pane_buffer(struct window_pane *wp)
 {
-	struct evbuffer			*evb = wp->event->input;
+	struct evbuffer			*evb = wp->input;
 	size_t				 minimum;
 	struct client			*c;
 	struct window_pane_offset	*wpo;
@@ -2167,10 +2167,7 @@ out:
 	 * accept any more data.
 	 */
 	log_debug("%s: pane %%%u is %s", __func__, wp->id, off ? "off" : "on");
-	if (off)
-		bufferevent_disable(wp->event, EV_READ);
-	else
-		bufferevent_enable(wp->event, EV_READ);
+	pane_io_set_read(wp, !off);
 }
 
 /* Move cursor for pane prompt. */

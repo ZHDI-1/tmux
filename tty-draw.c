@@ -123,7 +123,9 @@ tty_draw_line(struct tty *tty, struct screen *s, u_int px, u_int py, u_int nx,
 	const struct grid_cell	*gcp;
 	struct grid_cell	 gc, ngc, last;
 	struct grid_line	*gl;
+	const struct grid_cell_entry *gce, *first;
 	u_int			 i, j, last_i, cx, ex, width;
+	u_int			 run;
 	u_int			 cellsize, bg;
 	int			 flags, empty, wrapped = 0;
 	char			 buf[1000];
@@ -134,6 +136,7 @@ tty_draw_line(struct tty *tty, struct screen *s, u_int px, u_int py, u_int nx,
 #ifdef ENABLE_IMAGES
 	struct image		*im;
 	u_int			 x, y;
+	image_map_cb		 map_cell;
 #endif
 
 	if (style_ctx == NULL) {
@@ -242,6 +245,9 @@ tty_draw_line(struct tty *tty, struct screen *s, u_int px, u_int py, u_int nx,
 	len = 0;
 	width = 0;
 	current_state = TTY_DRAW_LINE_FIRST;
+#ifdef ENABLE_IMAGES
+	map_cell = image_prepare_map(tty, gd, gd->hsize + py);
+#endif
 	for (;;) {
 		/* Work out the next state. */
 		if (i == nx) {
@@ -264,8 +270,9 @@ tty_draw_line(struct tty *tty, struct screen *s, u_int px, u_int py, u_int nx,
 
 #ifdef ENABLE_IMAGES
 				/* Map an image cell if needed. */
-				gcp = image_map_cell(tty, gd, px + i,
-				    gd->hsize + py, gcp, &gc, &empty);
+				if (map_cell != NULL)
+					gcp = map_cell(tty, gd, px + i,
+					    gd->hsize + py, gcp, &gc, &empty);
 #endif
 
 				/* Flush the background before clearing. */
@@ -278,8 +285,9 @@ tty_draw_line(struct tty *tty, struct screen *s, u_int px, u_int py, u_int nx,
 
 #ifdef ENABLE_IMAGES
 				/* Map an image cell if needed. */
-				gcp = image_map_cell(tty, gd, px + i,
-				    gd->hsize + py, gcp, &gc, NULL);
+				if (map_cell != NULL)
+					gcp = map_cell(tty, gd, px + i,
+					    gd->hsize + py, gcp, &gc, NULL);
 #endif
 
 				/* Work out empty cells. */
@@ -314,10 +322,41 @@ tty_draw_line(struct tty *tty, struct screen *s, u_int px, u_int py, u_int nx,
 			else
 				next_state = TTY_DRAW_LINE_NEW1;
 		}
+		/* Coalesce identical compact blanks before expanding more
+		 * cells. */
+		if (next_state == TTY_DRAW_LINE_EMPTY && empty == 1
+		    && px + i < ex && gcp == &gc
+		    && !(gc.flags
+			& (GRID_FLAG_PADDING | GRID_FLAG_SELECTED
+			    | GRID_FLAG_TAB))
+#ifdef ENABLE_IMAGES
+		    && map_cell == NULL
+#endif
+		) {
+			gl = &gd->linedata[gd->hsize + py];
+			first = &gl->celldata[px + i];
+			if (!(first->flags & GRID_FLAG_EXTENDED)) {
+				for (run = 1; i + run < nx && px + i + run < ex;
+				    run++) {
+					gce = first + run;
+					if (gce->flags != first->flags
+					    || gce->data.attr
+						!= first->data.attr
+					    || gce->data.fg != first->data.fg
+					    || gce->data.bg != first->data.bg
+					    || (!(gce->flags
+						    & GRID_FLAG_CLEARED)
+						&& gce->data.data != ' '))
+						break;
+				}
+				empty = run;
+			}
+		}
 		if (log_get_level() != 0) {
 			log_debug("%s: cell %u empty %u, bg %u; state: "
-			    "current %s, next %s", __func__, px + i, empty,
-			    gcp->bg, tty_draw_line_states[current_state],
+				  "current %s, next %s",
+			    __func__, px + i, empty, gcp->bg,
+			    tty_draw_line_states[current_state],
 			    tty_draw_line_states[next_state]);
 		}
 
@@ -328,8 +367,8 @@ tty_draw_line(struct tty *tty, struct screen *s, u_int px, u_int py, u_int nx,
 				tty_draw_line_clear(tty, atx + last_i, aty,
 				    i - last_i, defaults, last.bg, wrapped);
 				wrapped = 0;
-			} else if (next_state != TTY_DRAW_LINE_SAME &&
-			    len != 0) {
+			} else if (next_state != TTY_DRAW_LINE_SAME
+			    && len != 0) {
 				tty_attributes(tty, &last, style_ctx);
 				if (atx + i - width != 0 || !wrapped)
 					tty_cursor(tty, atx + i - width, aty);
@@ -353,6 +392,44 @@ tty_draw_line(struct tty *tty, struct screen *s, u_int px, u_int py, u_int nx,
 			width += gcp->data.width;
 		}
 
+		/*
+		 * Printable compact cells with the same style need no per-cell
+		 * UTF-8 expansion or draw-state transition. Leave spaces and
+		 * all special cells to the normal clearing and selection logic.
+		 */
+		if (next_state == TTY_DRAW_LINE_SAME && px + i < ex
+		    && gcp == &gc && gc.data.size == 1 && gc.data.width == 1
+		    && gc.data.data[0] > ' ' && gc.data.data[0] < 0x7f
+		    && !(gc.flags
+			& (GRID_FLAG_PADDING | GRID_FLAG_SELECTED
+			    | GRID_FLAG_TAB | GRID_FLAG_CLEARED))
+		    && !(gc.attr & GRID_ATTR_CHARSET)
+#ifdef ENABLE_IMAGES
+		    && map_cell == NULL
+#endif
+		) {
+			gl = &gd->linedata[gd->hsize + py];
+			first = &gl->celldata[px + i];
+			if (!(first->flags & GRID_FLAG_EXTENDED)) {
+				for (run = 1; i + run < nx && px + i + run < ex
+				    && len < sizeof buf;
+				    run++) {
+					gce = first + run;
+					if (gce->flags != first->flags
+					    || gce->data.attr
+						!= first->data.attr
+					    || gce->data.fg != first->data.fg
+					    || gce->data.bg != first->data.bg
+					    || gce->data.data <= ' '
+					    || gce->data.data >= 0x7f)
+						break;
+					buf[len++] = gce->data.data;
+					width++;
+				}
+				i += run - 1;
+			}
+		}
+
 		/* If this is the last cell, we are done. */
 		if (next_state == TTY_DRAW_LINE_DONE)
 			break;
@@ -367,6 +444,6 @@ tty_draw_line(struct tty *tty, struct screen *s, u_int px, u_int py, u_int nx,
 	}
 
 out:
-	tty->flags = (tty->flags & ~TTY_NOCURSOR)|flags;
+	tty->flags = (tty->flags & ~TTY_NOCURSOR) | flags;
 	tty_update_mode(tty, tty->mode, s);
 }
