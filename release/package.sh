@@ -32,6 +32,7 @@ else
     strip -S "$output/$base/tmux"
     codesign --force --sign - "$output/$base/tmux"
     codesign --verify "$output/$base/tmux"
+    cp "$work"/jemalloc-*/COPYING "$output/$base/licenses/jemalloc.txt"
     clang --version > "$output/$base/toolchain.txt"
 fi
 git -C "$source_dir" rev-parse HEAD > "$output/$base/source-commit.txt"

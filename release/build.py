@@ -13,7 +13,11 @@ import tarfile
 import time
 
 HERE = Path(__file__).resolve().parent
-DEPS = json.loads((HERE / "dependencies.json").read_text())
+SYSTEM = platform.system()
+DEPS = {
+    name: dep for name, dep in json.loads((HERE / "dependencies.json").read_text()).items()
+    if dep.get("platform", SYSTEM) == SYSTEM
+}
 FALLBACKS = (
     "xterm,xterm-256color,xterm-direct,screen,screen-256color,tmux,"
     "tmux-256color,linux,vt100,alacritty,alacritty-direct,kitty,xterm-kitty,"
@@ -54,7 +58,7 @@ def main():
     work = args.work.resolve()
     work.mkdir()
     prefix = work / "prefix"
-    linux = platform.system() == "Linux"
+    linux = SYSTEM == "Linux"
     make = "make" if linux else "gmake"
     env = os.environ.copy()
     for key in ("CPATH", "C_INCLUDE_PATH", "LIBRARY_PATH", "PKG_CONFIG_PATH",
@@ -124,11 +128,16 @@ def main():
              f"--with-fallbacks={FALLBACKS}", f"--with-build-cc={env['CC']}"], build)
         run([make, "-C", "ncurses", "-B", "fallback.c"], build)
         make_install(build)
+        if not linux:
+            jemalloc = sources["jemalloc"]
+            run(["./configure", f"--prefix={prefix}", f"--libdir={prefix}/lib",
+                 "--disable-shared", "--enable-static"], jemalloc)
+            make_install(jemalloc)
         run(["sh", "autogen.sh"], source)
-        static = ["--enable-static"] if linux else []
+        platform_options = ["--enable-static"] if linux else ["--enable-jemalloc"]
         static_link = "-static " if linux else ""
         run(["./configure", "--prefix=/usr", "--disable-debug", "--enable-images",
-             "--enable-utf8proc", "--disable-systemd", "--disable-utempter", *static,
+             "--enable-utf8proc", "--disable-systemd", "--disable-utempter", *platform_options,
              "CFLAGS=-O2 -g -fno-omit-frame-pointer -pthread",
              f"CPPFLAGS=-I{prefix}/include -I{prefix}/include/ncursesw",
              f"LDFLAGS={static_link}-pthread -L{prefix}/lib {extra_link}", "YACC=bison -y"], source)

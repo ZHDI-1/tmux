@@ -23,5 +23,11 @@
     "url": "https://ftp.gnu.org/gnu/ncurses/ncurses-6.6.tar.gz",
     "archive": "ncurses.tar.gz",
     "sha256": "355b4cbbed880b0381a04c46617b7656e362585d52e9cf84a67e2009b749ff11"
+  },
+  "jemalloc": {
+    "url": "https://github.com/jemalloc/jemalloc/releases/download/5.3.0/jemalloc-5.3.0.tar.bz2",
+    "archive": "jemalloc.tar.bz2",
+    "sha256": "2db82d1e7119df3e71b7640219b6dfe84789bc0537983c3b7ac4f7189aecfeaa",
+    "platform": "Darwin"
   }
 }
