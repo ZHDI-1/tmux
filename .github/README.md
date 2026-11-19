@@ -1,5 +1,9 @@
 # Welcome to tmux!
 
+This fork publishes tmux io256 for Linux and macOS on x86-64 and arm64.
+See [releases](https://github.com/ZHDI-1/tmux/releases),
+[installation](../release/INSTALL.md), and the [release pin](../release/pin.json).
+
 tmux is a terminal multiplexer: it enables a number of terminals to be created,
 accessed, and controlled from a single screen. tmux may be detached from a
 screen and continue running in the background, then later reattached.
