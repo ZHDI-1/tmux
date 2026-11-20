@@ -1,6 +1,6 @@
 %global debug_package %{nil}
 
-Name:           tmux-io256
+Name:           tmux
 Version:        %{release_version}
 Release:        %{release_number}%{?dist}
 Summary:        tmux terminal multiplexer with the io256 PTY reader
@@ -21,11 +21,13 @@ BuildRequires:  ncurses
 BuildRequires:  patch
 BuildRequires:  pkgconf-pkg-config
 BuildRequires:  python3
+BuildRequires:  systemd-rpm-macros
 Requires:       glibc-minimal-langpack
+Obsoletes:      tmux-io256 < %{version}-%{release}
 
 %description
 The io256 tmux fork, linked statically with glibc and its third-party
-libraries. Its executable is named tmux-io256 so it can coexist with tmux.
+libraries. This package replaces the Fedora tmux package.
 
 %prep
 %setup -q -n tmux-io256-source
@@ -34,8 +36,9 @@ libraries. Its executable is named tmux-io256 so it can coexist with tmux.
 python3 release/build.py --offline --source tmux --cache downloads --work deps
 
 %install
-install -D -m 0755 tmux/tmux %{buildroot}%{_bindir}/tmux-io256
-install -D -m 0644 tmux/tmux.1 %{buildroot}%{_mandir}/man1/tmux-io256.1
+install -D -m 0755 tmux/tmux %{buildroot}%{_bindir}/tmux
+install -D -m 0644 tmux/tmux.1 %{buildroot}%{_mandir}/man1/tmux.1
+install -D -m 0644 release/tmux@.service %{buildroot}%{_unitdir}/tmux@.service
 mkdir licenses
 cp tmux/COPYING licenses/tmux.txt
 cp release/ghostty-terminfo.txt licenses/
@@ -46,10 +49,11 @@ cp deps/zlib-ng-*/LICENSE.md licenses/zlib-ng.txt
 cp deps/ncurses-*/COPYING licenses/ncurses.txt
 
 %check
-python3 release/smoke.py tmux/tmux
+python3 release/smoke.py %{buildroot}%{_bindir}/tmux
 
 %files
 %license licenses/*
-%doc release/INSTALL.md
-%{_bindir}/tmux-io256
-%{_mandir}/man1/tmux-io256.1*
+%doc release/INSTALL.md tmux/CHANGES tmux/README tmux/example_tmux.conf
+%{_bindir}/tmux
+%{_mandir}/man1/tmux.1*
+%{_unitdir}/tmux@.service

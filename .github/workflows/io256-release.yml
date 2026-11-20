@@ -153,7 +153,7 @@ jobs:
           else
             gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --target "$RELEASE_COMMIT"               --draft --title "tmux io256 $RELEASE_TAG" --notes-file ../release/INSTALL.md
           fi
-          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber             ./*.tar.gz ./*.src.rpm SHA256SUMS pin.json tmux-io256.rb
+          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber             ./*.tar.gz ./*.src.rpm SHA256SUMS pin.json tmux.rb
           gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
 
   copr:

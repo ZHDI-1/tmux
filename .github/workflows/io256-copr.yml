@@ -50,7 +50,11 @@ jobs:
             version=${RELEASE_TAG#v}
             rpm_version=${version%-io256.*}
             rpm_release=${version##*.}
-            srpm="tmux-io256-$rpm_version-$rpm_release.src.rpm"
+            package=tmux
+            if [ "$RELEASE_TAG" = v3.9-io256.1 ]; then
+              package=tmux-io256
+            fi
+            srpm="$package-$rpm_version-$rpm_release.src.rpm"
             url="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$srpm"
             if ! copr-cli get "$project"; then
               copr-cli create "$project" --chroot fedora-44-x86_64 --chroot fedora-44-aarch64                 --description "Static glibc tmux io256 builds"

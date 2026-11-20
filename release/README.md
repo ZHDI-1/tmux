@@ -19,7 +19,8 @@ To activate Fedora publication, add the Copr API config as the repository
 Actions secret `COPR_CONFIG`. The workflow uses the configured username by
 default. Set the Actions variable `COPR_OWNER` to use another owner or group
 where the account has publication access. The job creates `tmux-io256` with
-Fedora 44 and 45 chroots on first use and submits the published source RPM to Copr.
+Fedora 44 chroots on both architectures on first use and submits the published
+source RPM to Copr. The binary RPM and Homebrew formula both install `tmux`.
 The RPM is built from the vendored, checksum-pinned sources with network
 access disabled. Dispatch **io256 Copr publication** with an existing release tag to submit
 an already published source RPM without rebuilding the four archives.

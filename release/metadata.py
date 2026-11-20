@@ -18,7 +18,7 @@ def digest(path):
 arm = archives["macos-arm64"]
 intel = archives["macos-x86_64"]
 base = f"https://github.com/{repo}/releases/download/{tag}"
-formula = f'''class TmuxIo256 < Formula
+formula = f'''class Tmux < Formula
   desc "Tmux terminal multiplexer with the io256 PTY reader"
   homepage "https://github.com/{repo}"
   version "{tag.removeprefix('v')}"
@@ -36,17 +36,17 @@ formula = f'''class TmuxIo256 < Formula
   end
 
   def install
-    bin.install "tmux" => "tmux-io256"
-    man1.install "tmux.1" => "tmux-io256.1"
+    bin.install "tmux"
+    man1.install "tmux.1"
     pkgshare.install "licenses"
   end
 
   test do
-    assert_match "tmux", shell_output("#{{bin}}/tmux-io256 -V")
+    assert_match "tmux ", shell_output("#{{bin}}/tmux -V")
   end
 end
 '''
-(destination := directory / "tmux-io256.rb").write_text(formula)
+(destination := directory / "tmux.rb").write_text(formula)
 srpm = list(directory.glob("*.src.rpm"))
 if len(srpm) != 1:
     raise ValueError(f"Expected exactly one SRPM, found {srpm}")

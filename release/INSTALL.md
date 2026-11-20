@@ -17,13 +17,16 @@ On Linux, if the system lacks a UTF-8 locale, point glibc at the bundled data:
 The Linux binary uses the host's ordinary name-service configuration.
 External NSS backends may require compatible host modules.
 
-The Homebrew formula installs `tmux-io256` alongside stock tmux:
+Install the fork from its Homebrew tap. If Homebrew already has stock tmux
+installed, uninstall that formula first with `brew uninstall tmux`.
 
-    brew install ZHDI-1/tmux/tmux-io256
+    brew install ZHDI-1/tmux/tmux
 
-After the Copr repository is populated, enable it and install `tmux-io256`:
+On Fedora, enable the Copr repository and install `tmux`.
 
-    sudo dnf copr enable COPR_OWNER/tmux-io256
-    sudo dnf install tmux-io256
+    sudo dnf copr enable zhdi027/tmux-io256
+    sudo dnf install tmux
 
-For either package, start a new server with `tmux-io256 -L io256 new-session`.
+If Fedora already has tmux installed, use `sudo dnf upgrade tmux`.
+
+Launch it with `tmux`. To start a separate server, run `tmux -L io256 new-session`.
