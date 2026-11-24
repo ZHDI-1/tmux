@@ -173,6 +173,8 @@ AC_SEARCH_LIBS(flock, bsd)
 AC_CHECK_FUNCS([ \
 	dirfd \
 	flock \
+	posix_spawn_file_actions_addchdir_np \
+	posix_spawn_file_actions_addclosefrom_np \
 	prctl \
 	proc_pidinfo \
 	getpeerucred \

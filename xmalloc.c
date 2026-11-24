@@ -21,6 +21,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <pthread.h>
+
 #include "tmux.h"
 
 void *
@@ -165,8 +167,9 @@ xvsnprintf(char *str, size_t len, const char *fmt, va_list ap)
 
 /*
  * Private size-class slabs. Four classes per doubling bound internal waste
- * to 25%; keep at most one entirely empty slab per class. Server thread only.
- * All pointers passed to this API must originate here, never in a library.
+ * to 25%; keep at most one entirely empty slab per class.
+ * Shared grid rows retain payload allocations. A writer first makes them
+ * private. The slab lock only covers the free lists and slab bookkeeping.
  */
 struct xpool_slab;
 union xpool_header {
@@ -176,6 +179,7 @@ union xpool_header {
 			union xpool_header *next;
 			size_t capacity;
 		} u;
+		u_int refs;
 	} h;
 	long double align;
 };
@@ -191,6 +195,7 @@ struct xpool_slab {
 	long double align;
 };
 static struct xpool_class xpool_classes[44];
+static pthread_mutex_t xpool_mutex = PTHREAD_MUTEX_INITIALIZER;
 #if defined(__has_feature)
 #if __has_feature(address_sanitizer)
 #define XPOOL_ASAN 1
@@ -231,12 +236,16 @@ xpool_alloc(size_t size)
 	union xpool_header *h;
 	size_t capacity, stride, value;
 	u_int bits, index, count, i;
+
+	if (grid_job_metrics != NULL)
+		grid_job_metrics->allocations++;
 	if (size > 65536) {
 		if (size > SIZE_MAX - sizeof *h)
 			fatalx("xpool_alloc: overflow");
 		h = xmalloc(sizeof *h + size);
 		h->h.slab = NULL;
 		h->h.u.capacity = size;
+		h->h.refs = 1;
 		return h + 1;
 	}
 	if (size <= 64) {
@@ -248,6 +257,8 @@ xpool_alloc(size_t size)
 		index = 4 + (bits - 6) * 4 + ((size - 1) >> (bits - 2)) - 4;
 		capacity = (((size - 1) >> (bits - 2)) + 1) << (bits - 2);
 	}
+	if (pane_workers_enabled)
+		pthread_mutex_lock(&xpool_mutex);
 	bucket = &xpool_classes[index];
 	s = bucket->available;
 	if (s == NULL) {
@@ -278,11 +289,14 @@ xpool_alloc(size_t size)
 	if (--s->remaining == 0)
 		xpool_unlink(s);
 	h->h.u.capacity = size;
+	h->h.refs = 1;
 	XPOOL_UNPOISON(h + 1, size);
+	if (pane_workers_enabled)
+		pthread_mutex_unlock(&xpool_mutex);
 	return h + 1;
 }
 void
-xpool_free(void *ptr)
+xpool_free_private(void *ptr)
 {
 	union xpool_header *h;
 	struct xpool_slab *s;
@@ -294,6 +308,8 @@ xpool_free(void *ptr)
 		free(h);
 		return;
 	}
+	if (pane_workers_enabled)
+		pthread_mutex_lock(&xpool_mutex);
 	XPOOL_POISON(ptr, s->capacity);
 	h->h.u.next = s->first;
 	s->first = h;
@@ -306,9 +322,42 @@ xpool_free(void *ptr)
 		} else
 			s->bucket->empty = s;
 	}
+	if (pane_workers_enabled)
+		pthread_mutex_unlock(&xpool_mutex);
 }
+void
+xpool_retain(void *ptr)
+{
+	union xpool_header *h;
+
+	if (ptr == NULL)
+		return;
+	h = (union xpool_header *)ptr - 1;
+	__atomic_add_fetch(&h->h.refs, 1, __ATOMIC_RELAXED);
+}
+
+int
+xpool_unique(void *ptr)
+{
+	union xpool_header *h = (union xpool_header *)ptr - 1;
+
+	return (__atomic_load_n(&h->h.refs, __ATOMIC_ACQUIRE) == 1);
+}
+
+void
+xpool_release(void *ptr)
+{
+	union xpool_header *h;
+
+	if (ptr == NULL)
+		return;
+	h = (union xpool_header *)ptr - 1;
+	if (__atomic_sub_fetch(&h->h.refs, 1, __ATOMIC_ACQ_REL) == 0)
+		xpool_free_private(ptr);
+}
+
 void *
-xpool_reallocarray(void *ptr, size_t nmemb, size_t size)
+xpool_reallocarray_private(void *ptr, size_t nmemb, size_t size)
 {
 	union xpool_header *h;
 	size_t capacity, previous;
@@ -336,8 +385,13 @@ xpool_reallocarray(void *ptr, size_t nmemb, size_t size)
 	} else
 		previous = 0;
 	next = xpool_alloc(size);
-	if (previous != 0)
-		memcpy(next, ptr, size < previous ? size : previous);
-	xpool_free(ptr);
+	if (previous != 0) {
+		if (size > previous)
+			size = previous;
+		if (grid_job_metrics != NULL)
+			grid_job_metrics->growth_bytes += size;
+		memcpy(next, ptr, size);
+	}
+	xpool_free_private(ptr);
 	return next;
 }

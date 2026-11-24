@@ -58,6 +58,9 @@ TAILQ_HEAD(image_spans, image_span);
 struct image_line {
 	struct image_spans	 spans;
 	int			 in_region; /* Inside the current scroll region. */
+	uint64_t key;
+	uint64_t reflow_key;
+	RB_ENTRY(image_line) entry;
 };
 
 /* A placement of an image, may be across multiple lines */
@@ -75,8 +78,20 @@ struct image_placement {
 };
 TAILQ_HEAD(image_placements, image_placement);
 
+RB_HEAD(image_lines, image_line);
+
+static int
+image_line_cmp(struct image_line *a, struct image_line *b)
+{
+	return (a->key < b->key ? -1 : a->key > b->key);
+}
+
+RB_GENERATE_STATIC(image_lines, image_line, entry, image_line_cmp);
+static struct image_line *image_line_at(struct grid *, u_int);
+
 /* Placements owned by one grid. */
 struct image_store {
+	struct image_lines lines;
 	struct image_placements		 placements;
 	TAILQ_ENTRY(image_store)	 entry;
 };
@@ -233,7 +248,7 @@ image_prepare_map(struct tty *tty, struct grid *gd, u_int y)
 {
 	image_tty_update(tty);
 	if (tty->image_backend->map_cell == NULL ||
-	    y >= gd->hsize + gd->sy || gd->linedata[y].images == NULL)
+	    y >= gd->hsize + gd->sy || image_line_at(gd, y) == NULL)
 		return (NULL);
 	return (tty->image_backend->map_cell);
 }
@@ -276,7 +291,7 @@ image_draw_line(struct tty *tty, struct screen *s, u_int px, u_int py,
 	if (py >= s->grid->sy)
 		return;
 	gy = s->grid->hsize + py;
-	line = s->grid->linedata[gy].images;
+	line = image_line_at(s->grid, gy);
 	if (line == NULL)
 		return;
 	end = px + nx;
@@ -358,21 +373,58 @@ image_store_get(struct grid *gd)
 {
 	if (gd->images == NULL) {
 		gd->images = xcalloc(1, sizeof *gd->images);
+		RB_INIT(&gd->images->lines);
 		TAILQ_INIT(&gd->images->placements);
 		TAILQ_INSERT_TAIL(&image_stores, gd->images, entry);
 	}
 	return (gd->images);
 }
 
-/* Get the spans for a grid line. */
+/* Associations use stable keys. History trim and full-screen scroll
+ * change the logical boundary without rewriting existing keys. */
 static struct image_line *
-image_line_get(struct grid_line *gl)
+image_line_at(struct grid *gd, u_int y)
 {
-	if (gl->images == NULL) {
-		gl->images = xcalloc(1, sizeof *gl->images);
-		TAILQ_INIT(&gl->images->spans);
+	struct image_line needle = { .key = gd->row_first + y };
+
+	if (gd->images == NULL)
+		return (NULL);
+	return (RB_FIND(image_lines, &gd->images->lines, &needle));
+}
+
+static void
+image_line_install(struct grid *gd, u_int y, struct image_line *line)
+{
+	if (line == NULL)
+		return;
+	line->key = gd->row_first + y;
+	if (RB_INSERT(image_lines, &gd->images->lines, line) != NULL)
+		fatalx("duplicate image line association");
+}
+
+static struct image_line *
+image_line_take(struct grid *gd, u_int y)
+{
+	struct image_line *line = image_line_at(gd, y);
+
+	if (line != NULL)
+		RB_REMOVE(image_lines, &gd->images->lines, line);
+	return (line);
+}
+
+static struct image_line *
+image_line_get(struct grid *gd, u_int y)
+{
+	struct image_line *line = image_line_at(gd, y);
+
+	if (line == NULL) {
+		image_store_get(gd);
+		line = xcalloc(1, sizeof *line);
+		line->reflow_key = UINT64_MAX;
+		TAILQ_INIT(&line->spans);
+		image_line_install(gd, y, line);
 	}
-	return (gl->images);
+	return (line);
 }
 
 /* Create a placement. Takes a reference to the image. */
@@ -506,7 +558,7 @@ image_grid_add(struct grid *gd, struct image *im, u_int x, u_int y,
 
 	plmt = image_placement_create(gd, im);
 	for (row = 0; row < sy; row++) {
-		line = image_line_get(&gd->linedata[y + row]);
+		line = image_line_get(gd, y + row);
 		image_span_add(line, plmt, x, sx, src_x, src_y + row);
 	}
 }
@@ -570,7 +622,7 @@ image_grid_overwrite(struct grid *gd, u_int x, u_int y, u_int sx, u_int sy)
 	if (sy > rows - y)
 		sy = rows - y;
 	for (row = y; row < y + sy; row++)
-		image_line_overwrite(gd->linedata[row].images, x, sx);
+		image_line_overwrite(image_line_at(gd, row), x, sx);
 	image_store_prune(gd->images);
 }
 
@@ -583,7 +635,7 @@ image_placement_visible(struct grid *gd, struct image_placement *plmt)
 	u_int			 row;
 
 	for (row = gd->hsize; row < gd->hsize + gd->sy; row++) {
-		line = gd->linedata[row].images;
+		line = image_line_at(gd, row);
 		if (line == NULL)
 			continue;
 		TAILQ_FOREACH(span, &line->spans, line_entry) {
@@ -689,34 +741,128 @@ image_grid_remove_all(struct image *im)
 	}
 }
 
-/* Free all spans on a grid line. */
-void
-image_grid_free_line(struct grid *gd, struct grid_line *gl)
+static void
+image_line_free(struct image_line *line)
 {
-	struct image_line	*line = gl->images;
-	struct image_span	*span, *next;
+	struct image_span *span, *next;
 
 	if (line == NULL)
 		return;
-
 	TAILQ_FOREACH_SAFE(span, &line->spans, line_entry, next)
 		image_span_free(span);
 	free(line);
+}
 
-	gl->images = NULL;
+void
+image_grid_free_line(struct grid *gd, u_int y)
+{
+	struct image_line *line = image_line_take(gd, y);
+
+	if (line != NULL) {
+		image_line_free(line);
+		image_store_prune(gd->images);
+	}
+}
+
+void
+image_grid_drop_lines(struct grid *gd, u_int y, u_int count)
+{
+	struct image_line needle = { .key = gd->row_first + y };
+	struct image_line *line, *next;
+	uint64_t end = needle.key + count;
+
+	if (gd->images == NULL)
+		return;
+	line = RB_NFIND(image_lines, &gd->images->lines, &needle);
+	for (; line != NULL && line->key < end; line = next) {
+		next = RB_NEXT(image_lines, &gd->images->lines, line);
+		RB_REMOVE(image_lines, &gd->images->lines, line);
+		image_line_free(line);
+	}
 	image_store_prune(gd->images);
 }
 
-/* Free a grid's empty placement store. */
 void
 image_grid_free(struct grid *gd)
 {
-	if (gd->images != NULL) {
-		image_store_prune(gd->images);
-		TAILQ_REMOVE(&image_stores, gd->images, entry);
-		free(gd->images);
-		gd->images = NULL;
+	struct image_line *line;
+
+	if (gd->images == NULL)
+		return;
+	while ((line = RB_MIN(image_lines, &gd->images->lines)) != NULL) {
+		RB_REMOVE(image_lines, &gd->images->lines, line);
+		image_line_free(line);
 	}
+	image_store_prune(gd->images);
+	TAILQ_REMOVE(&image_stores, gd->images, entry);
+	free(gd->images);
+	gd->images = NULL;
+}
+
+/* The text move and any image save/restore are one coordinator transaction. */
+void
+image_grid_shift_rows(struct grid *gd, u_int dy, u_int py, u_int ny)
+{
+	u_int i, y;
+
+	if (gd->images == NULL)
+		return;
+	for (y = dy; y < dy + ny; y++) {
+		if (y < py || y >= py + ny)
+			image_line_free(image_line_take(gd, y));
+	}
+	for (i = 0; i < ny; i++) {
+		y = dy < py ? i : ny - 1 - i;
+		image_line_install(gd, dy + y, image_line_take(gd, py + y));
+	}
+	image_store_prune(gd->images);
+}
+
+void
+image_grid_scroll_region(struct grid *gd, u_int upper, u_int lower)
+{
+	struct image_line *outgoing;
+	u_int y;
+
+	if (gd->images == NULL)
+		return;
+	outgoing = image_line_take(gd, upper);
+	for (y = gd->hsize + gd->sy; y > lower + 1; y--)
+		image_line_install(gd, y, image_line_take(gd, y - 1));
+	for (y = upper; y > gd->hsize; y--)
+		image_line_install(gd, y, image_line_take(gd, y - 1));
+	image_line_install(gd, gd->hsize, outgoing);
+}
+
+void
+image_grid_reflow_line(struct grid *gd, u_int from, u_int to)
+{
+	struct image_line *line = image_line_at(gd, from);
+
+	if (line != NULL)
+		line->reflow_key = to;
+}
+
+void
+image_grid_reflow_finish(struct grid *gd)
+{
+	struct image_lines lines = RB_INITIALIZER(&lines);
+	struct image_line *line;
+
+	if (gd->images == NULL)
+		return;
+	while ((line = RB_MIN(image_lines, &gd->images->lines)) != NULL) {
+		RB_REMOVE(image_lines, &gd->images->lines, line);
+		if (line->reflow_key == UINT64_MAX) {
+			image_line_free(line);
+			continue;
+		}
+		line->key = line->reflow_key;
+		line->reflow_key = UINT64_MAX;
+		RB_INSERT(image_lines, &lines, line);
+	}
+	gd->images->lines = lines;
+	image_store_prune(gd->images);
 }
 
 /* Move the image spans belonging to a range of text cells. */
@@ -734,7 +880,7 @@ image_grid_move_cells(struct grid *gd, u_int dx, u_int px, u_int py, u_int nx)
 	    px == dx ||
 	    py >= gd->hsize + gd->sy)
 		return;
-	line = gd->linedata[py].images;
+	line = image_line_at(gd, py);
 	if (line == NULL)
 		return;
 
@@ -781,7 +927,7 @@ image_grid_mark_scroll(struct grid *gd, u_int upper, u_int lower)
 
 	/* Mark lines inside the scroll region. */
 	for (y = upper; y <= lower; y++) {
-		line = gd->linedata[y].images;
+		line = image_line_at(gd, y);
 		if (line == NULL)
 			continue;
 		line->in_region = 1;
@@ -791,7 +937,7 @@ image_grid_mark_scroll(struct grid *gd, u_int upper, u_int lower)
 
 	/* Mark placements which can move with the scroll region. */
 	for (y = upper; y <= lower; y++) {
-		line = gd->linedata[y].images;
+		line = image_line_at(gd, y);
 		if (line == NULL)
 			continue;
 		TAILQ_FOREACH(span, &line->spans, line_entry) {
@@ -815,7 +961,7 @@ image_grid_mark_scroll(struct grid *gd, u_int upper, u_int lower)
 
 	/* Clear the temporary marks. */
 	for (y = upper; y <= lower; y++) {
-		line = gd->linedata[y].images;
+		line = image_line_at(gd, y);
 		if (line != NULL)
 			line->in_region = 0;
 	}
@@ -824,9 +970,9 @@ image_grid_mark_scroll(struct grid *gd, u_int upper, u_int lower)
 
 /* Move spans between lines. */
 static void
-image_line_move(struct grid_line *dst, struct grid_line *src, int scroll)
+image_line_move(struct grid *gd, u_int dst, u_int src, int scroll)
 {
-	struct image_line	*line = src->images, *to = NULL;
+	struct image_line	*line = image_line_at(gd, src), *to = NULL;
 	struct image_span	*span, *next;
 	enum image_type		 type;
 
@@ -837,11 +983,11 @@ image_line_move(struct grid_line *dst, struct grid_line *src, int scroll)
 		if (type == IMAGE_TYPE_KITTY &&
 		    (!scroll || !span->placement->scroll))
 			continue;
-		if (dst == NULL)
+		if (dst == UINT_MAX)
 			image_span_free(span);
 		else {
 			if (to == NULL)
-				to = image_line_get(dst);
+				to = image_line_get(gd, dst);
 			TAILQ_REMOVE(&line->spans, span, line_entry);
 			image_span_insert(to, span);
 		}
@@ -870,7 +1016,7 @@ image_grid_move_lines(struct grid *gd, u_int dy, u_int py, u_int ny, int scroll)
 
 	for (y = dy; y < dy + ny; y++) {
 		if (y < py || y >= py + ny)
-			image_line_move(NULL, &gd->linedata[y], scroll);
+			image_line_move(gd, UINT_MAX, y, scroll);
 	}
 	for (y = 0; y < ny; y++) {
 		if (dy < py) {
@@ -880,7 +1026,7 @@ image_grid_move_lines(struct grid *gd, u_int dy, u_int py, u_int ny, int scroll)
 			dst = dy + ny - 1 - y;
 			src = py + ny - 1 - y;
 		}
-		image_line_move(&gd->linedata[dst], &gd->linedata[src], scroll);
+		image_line_move(gd, dst, src, scroll);
 	}
 	image_store_prune(gd->images);
 }
@@ -899,7 +1045,7 @@ image_grid_save_lines(struct grid *gd, u_int dy, u_int py, u_int ny, int scroll)
 	upper = (dy < py ? dy : py);
 	lower = (dy > py ? dy : py) + ny - 1;
 	for (y = upper; y <= lower; y++) {
-		if (gd->linedata[y].images != NULL)
+		if (image_line_at(gd, y) != NULL)
 			break;
 	}
 	if (y > lower)
@@ -913,10 +1059,8 @@ image_grid_save_lines(struct grid *gd, u_int dy, u_int py, u_int ny, int scroll)
 	saved->ny = ny;
 	saved->hsize = gd->hsize;
 	saved->scroll = scroll;
-	for (y = upper; y <= lower; y++) {
-		saved->lines[y - upper] = gd->linedata[y].images;
-		gd->linedata[y].images = NULL;
-	}
+	for (y = upper; y <= lower; y++)
+		saved->lines[y - upper] = image_line_take(gd, y);
 	return (saved);
 }
 
@@ -935,7 +1079,7 @@ image_grid_restore_lines(struct grid *gd, struct image_saved *saved)
 	upper = (dy < py ? dy : py);
 	lower = (dy > py ? dy : py) + saved->ny - 1;
 	for (y = upper; y <= lower; y++)
-		gd->linedata[y].images = saved->lines[y - upper];
+		image_line_install(gd, y, saved->lines[y - upper]);
 
 	if (offset != 0)
 		image_grid_move_lines(gd, saved->hsize, dy, 1, 0);
@@ -980,13 +1124,16 @@ image_grid_duplicate_lines(struct grid *dst, u_int dy, struct grid *src,
 	struct image_line	*src_line, *dst_line;
 	struct image_span	*span;
 	struct image_placement	*plmt;
-	u_int			 nmaps = 0, row;
+	struct image_line needle = { .key = src->row_first + sy };
+	uint64_t end = needle.key + ny;
+	u_int			 nmaps = 0;
 
-	for (row = 0; row < ny; row++) {
-		src_line = src->linedata[sy + row].images;
-		if (src_line == NULL)
-			continue;
-		dst_line = image_line_get(&dst->linedata[dy + row]);
+	if (src->images == NULL)
+		return;
+	src_line = RB_NFIND(image_lines, &src->images->lines, &needle);
+	for (; src_line != NULL && src_line->key < end;
+	    src_line = RB_NEXT(image_lines, &src->images->lines, src_line)) {
+		dst_line = image_line_get(dst, dy + src_line->key - needle.key);
 		TAILQ_FOREACH(span, &src_line->spans, line_entry) {
 			plmt = image_copy_placement(dst, span->placement, &maps,
 			    &nmaps);
@@ -1005,11 +1152,10 @@ image_grid_copy_area(struct grid *dst, u_int dx, u_int dy, struct grid *src,
 	struct image_copy_map	*maps = NULL;
 	struct image_placement	*plmt;
 	struct image_line	*src_line, *dst_line;
-	struct grid_line	*gl;
 	struct image_span	*span;
 	u_int			 nmaps = 0, row, start, end, span_end;
 
-	if (dst == src || sx == 0 || sy == 0)
+	if (dst == src || src->images == NULL || sx == 0 || sy == 0)
 		return;
 	if (dy >= dst->hsize + dst->sy || py >= src->hsize + src->sy)
 		return;
@@ -1022,7 +1168,7 @@ image_grid_copy_area(struct grid *dst, u_int dx, u_int dy, struct grid *src,
 		end = UINT_MAX;
 
 	for (row = 0; row < sy; row++) {
-		src_line = src->linedata[py + row].images;
+		src_line = image_line_at(src, py + row);
 		if (src_line == NULL)
 			continue;
 		dst_line = NULL;
@@ -1033,10 +1179,8 @@ image_grid_copy_area(struct grid *dst, u_int dx, u_int dy, struct grid *src,
 				continue;
 			if (span_end > end)
 				span_end = end;
-			if (dst_line == NULL) {
-				gl = &dst->linedata[dy + row];
-				dst_line = image_line_get(gl);
-			}
+			if (dst_line == NULL)
+				dst_line = image_line_get(dst, dy + row);
 			plmt = image_copy_placement(dst, span->placement, &maps,
 			    &nmaps);
 			plmt->recover_from = 0;
@@ -1050,9 +1194,11 @@ image_grid_copy_area(struct grid *dst, u_int dx, u_int dy, struct grid *src,
 
 /* Check whether a grid line has any image spans. */
 int
-image_grid_line_has_images(struct grid_line *gl)
+image_grid_line_has_images(struct grid *gd, u_int y)
 {
-	return (gl->images != NULL && !TAILQ_EMPTY(&gl->images->spans));
+	struct image_line *line = image_line_at(gd, y);
+
+	return (line != NULL && !TAILQ_EMPTY(&line->spans));
 }
 
 /* Check whether a grid area has any image spans. */
@@ -1076,7 +1222,7 @@ image_grid_area_has_images(struct grid *gd, u_int x, u_int y, u_int sx,
 		sy = gd->hsize + gd->sy - y;
 
 	for (row = y; row < y + sy; row++) {
-		line = gd->linedata[row].images;
+		line = image_line_at(gd, row);
 		if (line == NULL)
 			continue;
 		TAILQ_FOREACH(span, &line->spans, line_entry) {
@@ -1338,7 +1484,6 @@ image_write(struct screen_write_ctx *ctx, struct image *im, u_int bg,
 	struct screen		*s = ctx->s;
 	struct grid		*gd = s->grid;
 	struct image_placement	*plmt;
-	struct grid_line	*gl;
 	struct image_line	*line;
 	u_int			 cx = s->cx, cy = s->cy, y, lines;
 	u_int			 sx = ig->sx, sy = ig->sy;
@@ -1396,14 +1541,13 @@ image_write(struct screen_write_ctx *ctx, struct image *im, u_int bg,
 	if (h_origin_y > gd->hsize)
 		h_origin_y = gd->hsize;
 	for (y = 0; y < h_origin_y; y++) {
-		gl = &gd->linedata[gd->hsize - h_origin_y + y];
-		line = image_line_get(gl);
+		line = image_line_get(gd, gd->hsize - h_origin_y + y);
 		image_add_row(line, plmt, cx, origin_y - h_origin_y + y, sx);
 	}
 
 	/* Attach visible image rows. */
 	for (y = 0; y < sy; y++) {
-		line = image_line_get(&gd->linedata[gd->hsize + cy + y]);
+		line = image_line_get(gd, gd->hsize + cy + y);
 		image_add_row(line, plmt, cx, origin_y + y, sx);
 	}
 
@@ -1429,7 +1573,7 @@ image_grid_get_at(struct grid *gd, u_int x, u_int y, struct image **im,
 
 	if (y >= gd->hsize + gd->sy)
 		return (0);
-	line = gd->linedata[y].images;
+	line = image_line_at(gd, y);
 	if (line == NULL)
 		return (0);
 	TAILQ_FOREACH(span, &line->spans, line_entry) {

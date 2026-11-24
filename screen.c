@@ -329,8 +329,9 @@ screen_resize_cursor(struct screen *s, u_int sx, u_int sy, int reflow,
     int eat_empty, int cursor)
 {
 	u_int	cx = s->cx, cy = s->grid->hsize + s->cy;
+	int	collecting = s->write_list != NULL;
 
-	if (s->write_list != NULL)
+	if (collecting)
 		screen_write_free_list(s);
 
 	log_debug("%s: new size %ux%u, now %ux%u (cursor %u,%u = %u,%u)",
@@ -365,7 +366,7 @@ screen_resize_cursor(struct screen *s, u_int sx, u_int sy, int reflow,
 	log_debug("%s: cursor finished at %u,%u = %u,%u", __func__, s->cx,
 	    s->cy, cx, cy);
 
-	if (s->write_list != NULL)
+	if (collecting)
 		screen_write_make_list(s);
 }
 
@@ -380,7 +381,7 @@ static void
 screen_resize_y(struct screen *s, u_int sy, int eat_empty, u_int *cy)
 {
 	struct grid	*gd = s->grid;
-	u_int		 needed, available, oldy, i;
+	u_int		 needed, available, oldy, i, promote = 0;
 
 	if (sy == 0)
 		fatalx("zero size");
@@ -409,8 +410,7 @@ screen_resize_y(struct screen *s, u_int sy, int eat_empty, u_int *cy)
 					available = needed;
 #ifdef ENABLE_IMAGES
 				for (i = oldy - available; i < oldy; i++) {
-					image_grid_free_line(gd,
-					    &gd->linedata[gd->hsize + i]);
+					image_grid_free_line(gd, gd->hsize + i);
 				}
 #endif
 				grid_view_delete_lines(gd, oldy - available,
@@ -426,8 +426,8 @@ screen_resize_y(struct screen *s, u_int sy, int eat_empty, u_int *cy)
 		 */
 		available = s->cy;
 		if (gd->flags & GRID_HISTORY) {
-			gd->hscrolled += needed;
-			gd->hsize += needed;
+			for (i = 0; i < needed; i++)
+				grid_scroll_history_resize(gd);
 		} else if (needed > 0 && available > 0) {
 			if (available > needed)
 				available = needed;
@@ -436,34 +436,15 @@ screen_resize_y(struct screen *s, u_int sy, int eat_empty, u_int *cy)
 		}
 	}
 
-	/* Resize line array. */
-	grid_adjust_lines(gd, gd->hsize + sy);
-
-	/* Size increasing. */
-	if (sy > oldy) {
-		needed = sy - oldy;
-
-		/*
-		 * Try to pull as much as possible out of scrolled history, if
-		 * it is enabled.
-		 */
-		available = gd->hscrolled;
-		if (gd->flags & GRID_HISTORY && available > 0) {
-			if (available > needed)
-				available = needed;
-			gd->hscrolled -= available;
-			gd->hsize -= available;
-		} else
-			available = 0;
-		needed -= available;
-
-		/* Then fill the rest in with blanks. */
-		for (i = gd->hsize + sy - needed; i < gd->hsize + sy; i++)
-			grid_empty_line(gd, i, 8);
+	if (sy > oldy && (gd->flags & GRID_HISTORY)) {
+		promote = gd->hscrolled;
+		if (promote > sy - oldy)
+			promote = sy - oldy;
+		if (promote > gd->hsize)
+			promote = gd->hsize;
+		gd->hscrolled -= promote;
 	}
-
-	/* Set the new size, and reset the scroll region. */
-	gd->sy = sy;
+	grid_resize_viewport(gd, sy, promote);
 	s->rupper = 0;
 	s->rlower = screen_size_y(s) - 1;
 }
@@ -819,7 +800,7 @@ screen_print(struct screen *s, int line)
 	int			 n;
 	size_t			 last = 0;
 	struct utf8_data	 ud;
-	struct grid_line	*gl;
+	const struct grid_line	*gl;
 	struct grid_cell_entry	*gce;
 
 	if (buf == NULL)
@@ -833,7 +814,7 @@ screen_print(struct screen *s, int line)
 			goto out;
 		last += n;
 
-		gl = &s->grid->linedata[y];
+		gl = grid_get_line(s->grid, y);
 		for (x = 0; x < gl->cellused; x++) {
 			gce = &gl->celldata[x];
 			if (gce->flags & GRID_FLAG_PADDING)

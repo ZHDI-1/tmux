@@ -455,8 +455,8 @@ grid_reader_previous_output_range(struct grid_reader *gr, u_int *sx,
     u_int *sy, u_int *ex, u_int *ey)
 {
 	struct grid		*gd = gr->gd;
-	struct grid_line	*gl;
-	struct osc133_data	*od;
+	const struct grid_line	*gl;
+	const struct osc133_data	*od;
 	u_int			 cursor_x = gr->cx, cursor_y = gr->cy;
 	u_int			 start_x, start_y, y, total;
 	int			 found = 0, have_prompt = 0;
@@ -545,8 +545,8 @@ grid_reader_output_range(struct grid_reader *gr, u_int *sx, u_int *sy,
     u_int *ex, u_int *ey)
 {
 	struct grid		*gd = gr->gd;
-	struct grid_line	*gl;
-	struct osc133_data	*od;
+	const struct grid_line	*gl;
+	const struct osc133_data	*od;
 	u_int			 cursor_x = gr->cx, cursor_y = gr->cy;
 	u_int			 prompt_x = 0, prompt_y = UINT_MAX;
 	u_int			 y, total;

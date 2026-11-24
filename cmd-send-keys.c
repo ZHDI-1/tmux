@@ -233,6 +233,7 @@ cmd_send_keys_exec(struct cmd *self, struct cmdq_item *item)
 
 	if (args_has(args, 'R')) {
 		colour_palette_clear(&wp->palette);
+		pane_io_invalidate(wp);
 		input_reset(wp->ictx, 1);
 		wp->flags |= (PANE_STYLECHANGED|PANE_THEMECHANGED|PANE_REDRAW);
 	}

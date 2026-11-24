@@ -2030,7 +2030,7 @@ server_client_check_pane_resize(struct window_pane *wp)
 	struct window_pane_resize	*r, *first, *last;
 	struct timeval			 tv = { .tv_usec = 250000 };
 
-	if (TAILQ_EMPTY(&wp->resize_queue))
+	if (TAILQ_EMPTY(&wp->resize_queue) || pane_io_resize_pending(wp))
 		return;
 
 	if (!event_initialized(&wp->resize_timer))

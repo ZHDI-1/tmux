@@ -25,6 +25,8 @@
 #include <wchar.h>
 
 #include "compat.h"
+#include <pthread.h>
+
 #include "tmux.h"
 
 struct utf8_width_item {
@@ -246,7 +248,9 @@ RB_HEAD(utf8_index_tree, utf8_item);
 RB_GENERATE_STATIC(utf8_index_tree, utf8_item, index_entry, utf8_index_cmp);
 static struct utf8_index_tree utf8_index_tree = RB_INITIALIZER(utf8_index_tree);
 
-static int	utf8_no_width;
+static pthread_mutex_t utf8_items_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t utf8_width_mutex = PTHREAD_MUTEX_INITIALIZER;
+static __thread int utf8_no_width;
 static u_int	utf8_next_index;
 /* Zero means unknown; a cached width is stored plus one. */
 static u_char	utf8_width_memo[0x110000];
@@ -408,6 +412,8 @@ utf8_update_width_cache(void)
 	struct options_array_item	*a;
 	u_int				 i;
 
+	if (pane_workers_enabled)
+		pthread_mutex_lock(&utf8_width_mutex);
 	memset(utf8_width_memo, 0, sizeof utf8_width_memo);
 
 	RB_FOREACH_SAFE (uw, utf8_width_cache, &utf8_width_cache, uw1) {
@@ -427,11 +433,13 @@ utf8_update_width_cache(void)
 		utf8_add_to_width_cache(options_array_item_value(a)->string);
 		a = options_array_next(a);
 	}
+	if (pane_workers_enabled)
+		pthread_mutex_unlock(&utf8_width_mutex);
 }
 
 /* Add a UTF-8 item. */
 static int
-utf8_put_item(const u_char *data, size_t size, u_int *index)
+utf8_put_item_locked(const u_char *data, size_t size, u_int *index)
 {
 	struct utf8_item	*ui;
 
@@ -457,6 +465,19 @@ utf8_put_item(const u_char *data, size_t size, u_int *index)
 	*index = ui->index;
 	log_debug("%s: added %.*s = %u", __func__, (int)size, data, *index);
 	return (0);
+}
+
+static int
+utf8_put_item(const u_char *data, size_t size, u_int *index)
+{
+	int result;
+
+	if (pane_workers_enabled)
+		pthread_mutex_lock(&utf8_items_mutex);
+	result = utf8_put_item_locked(data, size, index);
+	if (pane_workers_enabled)
+		pthread_mutex_unlock(&utf8_items_mutex);
+	return (result);
 }
 
 /* Get UTF-8 character from data. */
@@ -508,7 +529,13 @@ utf8_to_data(utf8_char uc, struct utf8_data *ud)
 		ud->data[0] = (uc & 0xff);
 	} else {
 		index = (uc & 0xffffff);
-		if ((ui = utf8_item_by_index(index)) == NULL)
+		if (pane_workers_enabled)
+			pthread_mutex_lock(&utf8_items_mutex);
+		ui = utf8_item_by_index(index);
+		if (pane_workers_enabled)
+			pthread_mutex_unlock(&utf8_items_mutex);
+		/* Published items are immutable and live for the server lifetime. */
+		if (ui == NULL)
 			memset(ud->data, ' ', ud->size);
 		else
 			memcpy(ud->data, ui->data, ud->size);
@@ -549,12 +576,12 @@ utf8_copy(struct utf8_data *to, const struct utf8_data *from)
 
 /* Get width of Unicode character. */
 static enum utf8_state
-utf8_width_wc(wchar_t wc, int *width)
+utf8_width_wc_locked(wchar_t wc, int *width)
 {
 	struct utf8_width_item	*uw;
 	u_int			 at = (u_int)wc;
 
-	if (!log_debug_enabled && at < nitems(utf8_width_memo) &&
+	if (!log_debug_active() && at < nitems(utf8_width_memo) &&
 	    utf8_width_memo[at] != 0) {
 		*width = utf8_width_memo[at] - 1;
 		return (UTF8_DONE);
@@ -587,6 +614,19 @@ utf8_width_wc(wchar_t wc, int *width)
 		return (UTF8_DONE);
 	}
 	return (UTF8_ERROR);
+}
+
+static enum utf8_state
+utf8_width_wc(wchar_t wc, int *width)
+{
+	enum utf8_state result;
+
+	if (pane_workers_enabled)
+		pthread_mutex_lock(&utf8_width_mutex);
+	result = utf8_width_wc_locked(wc, width);
+	if (pane_workers_enabled)
+		pthread_mutex_unlock(&utf8_width_mutex);
+	return (result);
 }
 
 static enum utf8_state
@@ -672,7 +712,7 @@ utf8_decode_inline(const u_char *data, size_t len, u_int *codepoint)
 	} else
 		return (0);
 #ifdef HAVE_UTF8PROC
-	if (!log_debug_enabled && utf8_width_memo[cp] != 0)
+	if (!pane_workers_enabled && !log_debug_active() && utf8_width_memo[cp] != 0)
 		width = utf8_width_memo[cp] - 1;
 	else if (utf8_width_wc(cp, &width) != UTF8_DONE)
 		return (0);

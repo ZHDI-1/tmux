@@ -1,4 +1,4 @@
-/* Experimental bounded PTY gather/parse pipelines. Main owns all tmux state. */
+/* Bounded PTY gather queues and coordinator-side pane work scheduling. */
 #include <sys/types.h>
 #include <poll.h>
 #include <pthread.h>
@@ -41,8 +41,15 @@ struct pane_io {
  char tail_pad[64];
  unsigned char *data;
  char *trace;
+ FILE *job_trace;
  uint64_t reads, bytes, publications, full_waits, spins, polls, worker_ns;
  uint64_t callbacks, parsed;
+ struct pane_worker *worker;
+ uint64_t revision, work_revision;
+ uint64_t worker_bytes, worker_resizes, worker_runs, worker_rejected;
+ int resize_requested, copy_resize_requested, worker_unavailable;
+ enum { PANE_WORK_PARSE, PANE_WORK_RESIZE, PANE_WORK_COPY } work_type;
+ uint64_t worker_copy_resizes;
 };
 static struct pane_io *pane_ios;
 static int pane_io_atfork;
@@ -317,7 +324,18 @@ pane_io_start(struct window_pane *wp)
  p->slots = p->mode == 1 ? 1 : count;
  p->slot_capacity = bytes / p->slots;
  p->data = xmalloc(bytes);
- if (trace != NULL) p->trace = xstrdup(trace);
+ if (trace != NULL) {
+  char *path;
+  int trace_fd;
+  p->trace = xstrdup(trace);
+  if (pane_workers_enabled) {
+   xasprintf(&path, "%s.%ld.%u.jobs", trace, (long)getpid(), wp->id);
+   trace_fd = open(path, O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC, 0600);
+   if (trace_fd != -1 && (p->job_trace = fdopen(trace_fd, "w")) == NULL)
+    close(trace_fd);
+   free(path);
+  }
+ }
  if (pthread_mutex_init(&p->mutex, NULL) || pthread_cond_init(&p->space, NULL))
   fatalx("pane io synchronization init failed");
  pane_io_pipe(p->notify); pane_io_pipe(p->wake);
@@ -359,16 +377,144 @@ pane_io_finished(struct window_pane *wp)
  return IO_LOAD(&p->done) && IO_LOAD(&p->head) == IO_LOAD(&p->tail);
 }
 
+static int
+pane_io_get_worker(struct pane_io *p)
+{
+ if (!pane_workers_enabled || p->worker_unavailable)
+  return (0);
+ if (p->worker == NULL) {
+  p->worker = pane_worker_create(p->wp);
+  if (p->worker == NULL) {
+   p->worker_unavailable = 1;
+   return (0);
+  }
+ }
+ return (1);
+}
+
+void
+pane_io_worker_ready(struct window_pane *wp)
+{
+ pane_io_notify(wp->io);
+}
+
+void
+pane_io_invalidate(struct window_pane *wp)
+{
+ if (wp->io != NULL)
+  wp->io->revision++;
+}
+
+/* The layout changes now, while expensive width reflow uses a snapshot. */
+int
+pane_io_resize(struct window_pane *wp)
+{
+ struct pane_io *p = wp->io;
+ struct screen *s = &wp->base;
+
+ if (!pane_workers_enabled || p == NULL || !grid_worker_eligible(s->grid) ||
+     s->grid->hsize < 4096 || SCREEN_IS_ALTERNATE(s))
+  return (0);
+ if (screen_size_x(s) == wp->sx && !p->resize_requested &&
+     !(pane_worker_busy(p->worker) && p->work_type == PANE_WORK_RESIZE))
+  return (0);
+ if (!pane_io_get_worker(p))
+  return (0);
+ p->resize_requested = 1;
+ pane_io_notify(p);
+ return (1);
+}
+
+int
+pane_io_resize_pending(struct window_pane *wp)
+{
+ return (wp->io != NULL && wp->io->resize_requested);
+}
+
+int
+pane_io_resize_copy(struct window_pane *wp)
+{
+ struct pane_io *p = wp->io;
+
+ if (p == NULL || !pane_io_get_worker(p))
+  return (0);
+ p->copy_resize_requested = 1;
+ pane_io_notify(p);
+ return (1);
+}
+
+static int
+pane_io_start_resize(struct pane_io *p)
+{
+ struct window_pane *wp = p->wp;
+ struct screen *s = &wp->base;
+ u_int old_width = screen_size_x(s);
+
+ if (!p->resize_requested)
+  return (0);
+ if (old_width == wp->sx && screen_size_y(s) == wp->sy) {
+  p->resize_requested = 0;
+  return (0);
+ }
+ if (pane_worker_submit(p->worker, wp, NULL, 0, wp->sx, wp->sy, 0)) {
+  p->work_revision = p->revision;
+  p->work_type = PANE_WORK_RESIZE;
+  return (1);
+ }
+
+ /* Alternate screens, images and synchronized output stay on main. */
+ screen_resize(s, wp->sx, wp->sy, s->saved_grid == NULL);
+#ifdef ENABLE_IMAGES
+ if (wp->sx > old_width)
+  image_grid_resize_width(s->grid, wp->sx);
+#endif
+ wp->flags |= PANE_REDRAW|PANE_REDRAWSCROLLBAR;
+ p->resize_requested = 0;
+ return (0);
+}
+
 static void
 pane_io_callback(__unused int fd, __unused short events, void *arg)
 {
  struct pane_io *p = arg;
- size_t head, tail, end, available, first, total = 0;
+ struct pane_work *work;
+ size_t head, tail, end, available, first, total = 0, used = 0;
  const unsigned char *a, *b;
- int wake;
+ int wake, finished_parse = 0;
  pane_io_drain_fd(p->notify[0]);
  __atomic_exchange_n(&p->notified, 0, __ATOMIC_ACQ_REL);
  IO_TRACE(p, callbacks, 1);
+ if (pane_worker_busy(p->worker)) {
+  work = pane_worker_take(p->worker);
+  if (work == NULL)
+   return; /* Completion will wake us, even if the PTY stopped writing. */
+  finished_parse = p->work_type == PANE_WORK_PARSE;
+  if (p->work_type == PANE_WORK_COPY) {
+   if (window_copy_worker_finish(p->wp, work))
+    p->worker_copy_resizes++;
+   else
+    p->worker_rejected++;
+  } else if (p->work_revision == p->revision &&
+      (!finished_parse || window_pane_io_direct(p->wp))) {
+   used = pane_worker_apply(work, p->wp, p->job_trace);
+   p->worker_bytes += used;
+   p->worker_resizes += !finished_parse;
+  } else {
+   p->worker_rejected++;
+   pane_worker_reject(work, p->wp, p->job_trace);
+  }
+ }
+ if (!finished_parse) {
+  if (pane_io_start_resize(p))
+   return;
+  if (p->copy_resize_requested) {
+   p->copy_resize_requested = 0;
+   if (window_copy_worker_submit(p->wp, p->worker)) {
+    p->work_type = PANE_WORK_COPY;
+    return;
+   }
+  }
+ }
  /* Consume only what was queued at entry, then yield to tty writes.
   * Chasing a live producer here can starve output and trigger TTY_BLOCK. */
  end = IO_LOAD(&p->head);
@@ -392,8 +538,26 @@ pane_io_callback(__unused int fd, __unused short events, void *arg)
    a = p->data + (tail % p->slots) * p->slot_capacity;
    pthread_mutex_unlock(&p->mutex);
   }
-  /* Producer cannot reuse these bytes/slot until this returns. */
-  window_pane_io_data(p->wp, a, first, b, available - first);
+  if (!finished_parse && p->mode != 1 && first >= 4096 &&
+      first <= 65536 && pane_workers_enabled && !p->resize_requested &&
+      !p->copy_resize_requested &&
+      grid_worker_eligible(p->wp->base.grid) && window_pane_io_direct(p->wp) &&
+      pane_io_get_worker(p) &&
+      pane_worker_submit(p->worker, p->wp, a, first, 0, 0,
+      p->job_trace != NULL)) {
+   p->work_type = PANE_WORK_PARSE;
+   p->work_revision = p->revision;
+   p->worker_runs++;
+   return; /* Keep the original slot until its committed offset is known. */
+  }
+  /* Producer cannot reuse these bytes until the coordinator advances tail. */
+  if (used != 0)
+   window_pane_io_advance(p->wp, used);
+  if (available != used)
+   window_pane_io_data(p->wp, a + used, first - used, b,
+       available - first);
+  used = 0;
+  finished_parse = 0;
   IO_TRACE(p, parsed, available);
   total += available;
   if (p->mode == 1) {
@@ -413,7 +577,9 @@ pane_io_callback(__unused int fd, __unused short events, void *arg)
    if (wake) pane_io_wake(p);
   }
  }
- if (IO_LOAD(&p->head) != IO_LOAD(&p->tail)) pane_io_notify(p);
+ if (IO_LOAD(&p->head) != IO_LOAD(&p->tail) ||
+     p->resize_requested || p->copy_resize_requested)
+  pane_io_notify(p);
  if (pane_io_finished(p->wp)) {
   window_pane_io_eof(p->wp); /* May destroy p and wp. Do not access either. */
   return;
@@ -430,23 +596,28 @@ pane_io_destroy(struct window_pane *wp)
  wp->io = NULL;
  event_del(&p->event);
  pane_io_stop_thread(p);
+ pane_worker_destroy(p->worker, p->data);
  for (link = &pane_ios; *link != NULL; link = &(*link)->next)
   if (*link == p) { *link = p->next; break; }
  if (p->trace != NULL) {
   xasprintf(&path, "%s.%ld.%u.json", p->trace, (long)getpid(), wp->id);
   if ((f = fopen(path, "w")) != NULL) {
-   fprintf(f, "{\"mode\":%d,\"bytes\":%llu,\"slots\":%d,\"read_calls\":%llu,\"input_bytes\":%llu,\"publications\":%llu,\"full_waits\":%llu,\"spin_reads\":%llu,\"polls\":%llu,\"worker_cpu_ns\":%llu,\"callbacks\":%llu,\"parsed_bytes\":%llu}\n",
+   fprintf(f, "{\"mode\":%d,\"bytes\":%llu,\"slots\":%d,\"read_calls\":%llu,\"input_bytes\":%llu,\"publications\":%llu,\"full_waits\":%llu,\"spin_reads\":%llu,\"polls\":%llu,\"worker_cpu_ns\":%llu,\"callbacks\":%llu,\"parsed_bytes\":%llu,\"worker_bytes\":%llu,\"worker_runs\":%llu,\"worker_resizes\":%llu,\"worker_rejected\":%llu,\"worker_copy_resizes\":%llu}\n",
     p->mode, (unsigned long long)p->capacity, p->slots,
     (unsigned long long)p->reads, (unsigned long long)p->bytes,
     (unsigned long long)p->publications, (unsigned long long)p->full_waits,
     (unsigned long long)p->spins, (unsigned long long)p->polls,
     (unsigned long long)p->worker_ns, (unsigned long long)p->callbacks,
-    (unsigned long long)p->parsed);
+    (unsigned long long)p->parsed, (unsigned long long)p->worker_bytes,
+    (unsigned long long)p->worker_runs, (unsigned long long)p->worker_resizes,
+    (unsigned long long)p->worker_rejected,
+    (unsigned long long)p->worker_copy_resizes);
    fclose(f);
   }
   free(path);
  }
  close(p->notify[0]); close(p->notify[1]); close(p->wake[0]); close(p->wake[1]);
  pthread_cond_destroy(&p->space); pthread_mutex_destroy(&p->mutex);
- free(p->trace); free(p->data); free(p);
+ if (p->job_trace != NULL) fclose(p->job_trace);
+ free(p->trace); free(p);
 }

@@ -1065,9 +1065,9 @@ struct input_csi_cache {
 		} op;
 	} u;
 };
-static struct input_csi_cache input_csi_cache[512];
-static u_int input_csi_cache_attempts, input_csi_cache_hits;
-static u_int input_csi_cache_bypass;
+static __thread struct input_csi_cache input_csi_cache[512];
+static __thread u_int input_csi_cache_attempts, input_csi_cache_hits;
+static __thread u_int input_csi_cache_bypass;
 
 /* Unrepeated colour streams use the ordinary parser after a bounded probe. */
 static void
@@ -1280,7 +1280,7 @@ input_try_utf8(struct input_ctx *ictx, const u_char *buf, size_t len)
 	size_t			 off = 0;
 	u_int			 n = 0, width = 0, available, cp, columns;
 
-	if ((s->mode & MODE_INSERT) || s->sel != NULL || log_debug_enabled)
+	if ((s->mode & MODE_INSERT) || s->sel != NULL || log_debug_active())
 		return (0);
 	screen_write_collect_end(&ictx->ctx);
 	available = screen_size_x(s);
@@ -1327,7 +1327,7 @@ input_try_lines(struct input_ctx *ictx, const u_char *buf, size_t len,
 
 	if (s->cx != 0 ||
 	    s->cy != s->rlower || len < 4 * (size_t)screen_size_y(s) ||
-	    (s->mode & MODE_INSERT) || s->sel != NULL || log_debug_enabled)
+	    (s->mode & MODE_INSERT) || s->sel != NULL || log_debug_active())
 		return (0);
 	while (off < len) {
 		start = off;
@@ -1459,14 +1459,46 @@ input_set_ascii_last(struct input_ctx *ictx, u_char ch)
  ictx->flags |= INPUT_LAST;
 }
 
-/* Parse data. */
-static void
+/*
+ * Screen-local CSI operations with no private marker or intermediate byte.
+ * A complete sequence is required before a worker enters its CSI state.
+ */
+static size_t
+input_local_csi(const u_char *buf, size_t len)
+{
+	size_t i;
+
+	if (len < 3 || buf[1] != '[')
+		return (0);
+	for (i = 2; i < len && i < 66; i++) {
+		if (buf[i] >= '0' && buf[i] <= '9')
+			continue;
+		if (buf[i] == ';' || buf[i] == ':')
+			continue;
+		switch (buf[i]) {
+		case '@': case 'A': case 'B': case 'C': case 'D':
+		case 'E': case 'F': case 'G': case 'H': case 'I':
+		case 'J': case 'K': case 'L': case 'M': case 'P':
+		case 'S': case 'T': case 'X': case 'Z': case '`':
+		case 'a': case 'b': case 'd': case 'e': case 'f':
+		case 'g': case 'm': case 'r':
+			return (i + 1);
+		default:
+			return (0);
+		}
+	}
+	return (0);
+}
+
+/* Parse data. A headless run stops before the first external effect. */
+static size_t
 input_parse(struct input_ctx* ictx, const u_char* buf, size_t len)
 {
 	struct screen_write_ctx* sctx = &ictx->ctx;
 	const struct input_transition* itr = NULL;
 	size_t off = 0, since = 0, used;
-	size_t line_retry = 0, retry;
+	size_t line_retry = 0, retry, local_end = 0;
+	int headless = sctx->flags & SCREEN_WRITE_HEADLESS;
 
 	/* Parse the input. */
 	while (off < len) {
@@ -1516,6 +1548,17 @@ input_parse(struct input_ctx* ictx, const u_char* buf, size_t len)
 				since = off;
 				continue;
 			}
+		}
+		if (headless && off >= local_end) {
+			if (buf[off] == '\033') {
+				used = input_local_csi(buf + off, len - off);
+				if (used == 0)
+					break;
+				local_end = off + used;
+			} else if (!(buf[off] >= 0x20 && buf[off] <= 0x7e) &&
+			    !(buf[off] >= '\010' && buf[off] <= '\017') &&
+			    buf[off] != 0)
+				break;
 		}
 		ictx->ch = buf[off++];
 
@@ -1567,6 +1610,7 @@ input_parse(struct input_ctx* ictx, const u_char* buf, size_t len)
 		evbuffer_add(ictx->since_ground, buf + since, off - since);
 		ictx->since_ground_pending = 1;
 	}
+	return (off);
 }
 
 static void input_parse_vectors(struct window_pane *,
@@ -1620,16 +1664,10 @@ input_parse_buffers(struct window_pane *wp, const u_char *a, size_t na,
 		input_parse_vectors(wp, vec, nb != 0 ? 2 : 1);
 }
 
-/* Keep one collection open while consuming borrowed evbuffer chains. */
+/* Publish input activity once for each application of pane bytes. */
 static void
-input_parse_vectors(struct window_pane *wp, const struct evbuffer_iovec *vec,
-		    int count)
+input_pane_activity(struct window_pane *wp)
 {
-	struct input_ctx *ictx = wp->ictx;
-	struct screen_write_ctx *sctx = &ictx->ctx;
-
-	int n;
-
 	wp->output_generation++;
 	window_update_activity(wp->window);
 	if (~wp->flags & PANE_ACTIVITY) {
@@ -1638,10 +1676,20 @@ input_parse_vectors(struct window_pane *wp, const struct evbuffer_iovec *vec,
 	}
 	wp->flags |= PANE_CHANGED;
 
-	/* Flag new input while in a mode. */
 	if (!TAILQ_EMPTY(&wp->modes))
 		wp->flags |= PANE_UNSEENCHANGES;
+}
 
+/* Keep one collection open while consuming borrowed evbuffer chains. */
+static void
+input_parse_vectors(struct window_pane *wp, const struct evbuffer_iovec *vec,
+    int count)
+{
+	struct input_ctx *ictx = wp->ictx;
+	struct screen_write_ctx *sctx = &ictx->ctx;
+	int n;
+
+	input_pane_activity(wp);
 	/* NULL wp if there is a mode set as don't want to update the tty. */
 	if (TAILQ_EMPTY(&wp->modes))
 		screen_write_start_pane(sctx, wp, &wp->base);
@@ -1673,6 +1721,78 @@ input_parse_screen(struct input_ctx *ictx, struct screen *s,
 	sctx->flags |= SCREEN_WRITE_INPUT;
 	input_parse(ictx, buf, len);
 	screen_write_stop(sctx);
+}
+
+/* Only parser state that can cross a complete, screen-local run. */
+static void
+input_worker_state(struct input_ctx *dst, const struct input_ctx *src)
+{
+	dst->cell = src->cell;
+	dst->ch = src->ch;
+	dst->last = src->last;
+	dst->utf8data = src->utf8data;
+	dst->flags = src->flags;
+}
+
+struct input_ctx *
+input_worker_clone(const struct input_ctx *src)
+{
+	struct input_ctx *dst;
+
+	if (src == NULL || src->state != &input_state_ground ||
+	    src->utf8started || src->since_ground_pending ||
+	    src->ground_timer_armed || log_get_level() != 0)
+		return (NULL);
+	dst = xcalloc(1, sizeof *dst);
+	dst->state = &input_state_ground;
+	dst->input_buf = xmalloc(INPUT_BUF_START);
+	dst->input_space = INPUT_BUF_START;
+	dst->since_ground = evbuffer_new();
+	if (dst->since_ground == NULL)
+		fatalx("out of memory");
+	input_worker_state(dst, src);
+	return (dst);
+}
+
+size_t
+input_worker_parse(struct input_ctx *ictx, struct screen *s,
+    const u_char *buf, size_t len, int scroll_on_clear)
+{
+	size_t used;
+
+	screen_write_start(&ictx->ctx, s);
+	ictx->ctx.flags |= SCREEN_WRITE_INPUT|SCREEN_WRITE_HEADLESS;
+	if (scroll_on_clear)
+		ictx->ctx.flags |= SCREEN_WRITE_SCROLL_ON_CLEAR;
+	used = input_parse(ictx, buf, len);
+	screen_write_stop(&ictx->ctx);
+	if (ictx->state != &input_state_ground || ictx->utf8started ||
+	    ictx->ground_timer_armed || ictx->since_ground_pending)
+		fatalx("pane worker stopped outside ground state");
+	return (used);
+}
+
+void
+input_worker_commit(struct window_pane *wp, const struct input_ctx *ictx)
+{
+	input_worker_state(wp->ictx, ictx);
+	input_pane_activity(wp);
+}
+
+void
+input_worker_free(struct input_ctx *ictx)
+{
+	u_int i;
+
+	if (ictx == NULL)
+		return;
+	for (i = 0; i < ictx->param_list_len; i++) {
+		if (ictx->param_list[i].type == INPUT_STRING)
+			free(ictx->param_list[i].str);
+	}
+	evbuffer_free(ictx->since_ground);
+	free(ictx->input_buf);
+	free(ictx);
 }
 
 /* Split the parameter list (if any). */
@@ -4013,7 +4133,7 @@ input_osc_133(struct input_ctx *ictx, const char *p)
 	int			 status;
 
 	if (line < gd->hsize + gd->sy)
-		gl = grid_get_line(gd, line);
+		gl = grid_edit_line_record(gd, line);
 
 	switch (*p) {
 	case 'A':

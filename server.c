@@ -209,6 +209,7 @@ server_start(struct tmuxproc *client, uint64_t flags, struct event_base *base,
 		fatal("pledge failed");
 
 	input_key_build();
+	pane_workers_init();
 	utf8_update_width_cache();
 	RB_INIT(&windows);
 	RB_INIT(&all_window_panes);
@@ -267,6 +268,18 @@ server_start(struct tmuxproc *client, uint64_t flags, struct event_base *base,
 	exit(0);
 }
 
+/* Reclaim abandoned history at a bounded rate on the event loop. */
+static struct event server_row_reclaim_timer;
+
+static void
+server_row_reclaim(__unused int fd, __unused short events, __unused void *arg)
+{
+	struct timeval delay = { .tv_usec = 1000 };
+
+	if (grid_rows_reclaim(8))
+		evtimer_add(&server_row_reclaim_timer, &delay);
+}
+
 /* Server loop callback. */
 static int
 server_loop(void)
@@ -287,6 +300,10 @@ server_loop(void)
 	} while (items != 0);
 
 	server_client_loop();
+	if (!event_initialized(&server_row_reclaim_timer))
+		evtimer_set(&server_row_reclaim_timer, server_row_reclaim, NULL);
+	if (!evtimer_pending(&server_row_reclaim_timer, NULL))
+		server_row_reclaim(-1, 0, NULL);
 
 	if (!options_get_number(global_options, "exit-empty") && !server_exit)
 		return (0);

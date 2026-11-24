@@ -1045,7 +1045,7 @@ format_cb_history_bytes(struct format_tree *ft)
 {
 	struct window_pane	*wp = ft->wp;
 	struct grid		*gd;
-	struct grid_line	*gl;
+	const struct grid_line	*gl;
 	size_t			 size = 0;
 	u_int			 i;
 	char			*value;
@@ -1073,7 +1073,7 @@ format_cb_history_all_bytes(struct format_tree *ft)
 {
 	struct window_pane	*wp = ft->wp;
 	struct grid		*gd;
-	struct grid_line	*gl;
+	const struct grid_line	*gl;
 	u_int			 i, lines, cells = 0, extended_cells = 0;
 	char			*value;
 

@@ -50,7 +50,7 @@ log_add_level(void)
 int
 log_get_level(void)
 {
-	return (log_level);
+	return (pane_worker_thread ? 0 : log_level);
 }
 
 /* Open logging to file. */
@@ -132,7 +132,7 @@ log_debug(const char *msg, ...)
 {
 	va_list	ap;
 
-	if (log_file == NULL)
+	if (pane_worker_thread || log_file == NULL)
 		return;
 
 	va_start(ap, msg);

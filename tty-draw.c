@@ -122,7 +122,7 @@ tty_draw_line(struct tty *tty, struct screen *s, u_int px, u_int py, u_int nx,
 	struct grid		*gd = s->grid;
 	const struct grid_cell	*gcp;
 	struct grid_cell	 gc, ngc, last;
-	struct grid_line	*gl;
+	const struct grid_line	*gl;
 	const struct grid_cell_entry *gce, *first;
 	u_int			 i, j, last_i, cx, ex, width;
 	u_int			 run;
@@ -333,7 +333,7 @@ tty_draw_line(struct tty *tty, struct screen *s, u_int px, u_int py, u_int nx,
 		    && map_cell == NULL
 #endif
 		) {
-			gl = &gd->linedata[gd->hsize + py];
+			gl = grid_get_line(gd, gd->hsize + py);
 			first = &gl->celldata[px + i];
 			if (!(first->flags & GRID_FLAG_EXTENDED)) {
 				for (run = 1; i + run < nx && px + i + run < ex;
@@ -408,7 +408,7 @@ tty_draw_line(struct tty *tty, struct screen *s, u_int px, u_int py, u_int nx,
 		    && map_cell == NULL
 #endif
 		) {
-			gl = &gd->linedata[gd->hsize + py];
+			gl = grid_get_line(gd, gd->hsize + py);
 			first = &gl->celldata[px + i];
 			if (!(first->flags & GRID_FLAG_EXTENDED)) {
 				for (run = 1; i + run < nx && px + i + run < ex

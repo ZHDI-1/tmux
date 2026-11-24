@@ -137,7 +137,12 @@ void		 image_grid_add(struct grid *, struct image *, u_int, u_int,
 		     u_int, u_int, u_int, u_int);
 void		 image_grid_overwrite(struct grid *, u_int, u_int, u_int,
 		     u_int);
-void		 image_grid_free_line(struct grid *, struct grid_line *);
+void		 image_grid_drop_lines(struct grid *, u_int, u_int);
+void		 image_grid_shift_rows(struct grid *, u_int, u_int, u_int);
+void		 image_grid_scroll_region(struct grid *, u_int, u_int);
+void		 image_grid_reflow_line(struct grid *, u_int, u_int);
+void		 image_grid_reflow_finish(struct grid *);
+void		 image_grid_free_line(struct grid *, u_int);
 void		 image_grid_free(struct grid *);
 void		 image_grid_remove_all(struct image *);
 void		 image_grid_move_cells(struct grid *, u_int, u_int, u_int,
@@ -150,7 +155,7 @@ void		 image_grid_duplicate_lines(struct grid *, u_int, struct grid *,
 void		 image_grid_copy_area(struct grid *, u_int, u_int,
 		     struct grid *, u_int, u_int, u_int, u_int);
 void		 image_grid_resize_width(struct grid *, u_int);
-int		 image_grid_line_has_images(struct grid_line *);
+int		 image_grid_line_has_images(struct grid *, u_int);
 int		 image_grid_has_image(struct grid *, u_int);
 u_int		 image_grid_clear(struct grid *, u_int);
 u_int		 image_grid_clear_visible(struct grid *, enum image_type);
