@@ -1,10 +1,12 @@
 # tmux io256
 
-The release pin in the fork identifies the source revision. The first release
-carries the tested io256 alpha source, so `tmux -V` still reports
-`next-3.9-alpha1-io256`. The Linux executables link glibc and the third-party
-dependencies statically. The macOS executables use Apple's system libraries
-and include the third-party dependencies, including jemalloc. The macOS deployment target is 15.
+The release pin in the fork identifies the source revision. This release builds
+on the io256 alpha (`tmux -V` reports `next-3.9-alpha1-io256`) and adds split
+flat-viewport / persistent-radix scrollback storage, out-of-place width reflow,
+and opt-in per-pane workers (`TMUX_PANE_WORKERS=1`). The Linux executables link
+glibc and the third-party dependencies statically. The macOS executables use
+Apple's system libraries and include the third-party dependencies, including
+jemalloc. The macOS deployment target is 15.
 
 Start a separate server from an extracted archive:
 
