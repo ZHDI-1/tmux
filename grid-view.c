@@ -65,7 +65,7 @@ grid_view_set_cells(struct grid *gd, u_int px, u_int py,
 void
 grid_view_clear_history(struct grid *gd, u_int bg)
 {
-	struct grid_line	*gl;
+	const struct grid_line	*gl;
 	u_int			 yy, last;
 
 	/* Find the last used line. */
@@ -75,7 +75,7 @@ grid_view_clear_history(struct grid *gd, u_int bg)
 		if (gl->cellused != 0)
 			last = yy + 1;
 #ifdef ENABLE_IMAGES
-		else if (image_grid_line_has_images(gl))
+		else if (image_grid_line_has_images(gd, grid_view_y(gd, yy)))
 			last = yy + 1;
 #endif
 	}

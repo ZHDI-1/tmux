@@ -89,6 +89,7 @@ endif
 # List of sources.
 dist_tmux_SOURCES = \
 	pane-io.c \
+	pane-worker.c \
 	alerts.c \
 	arguments.c \
 	attributes.c \
@@ -171,6 +172,7 @@ dist_tmux_SOURCES = \
 	format.c \
 	fuzzy.c \
 	grid-reader.c \
+	grid-lines.c \
 	grid-view.c \
 	grid.c \
 	hooks.c \

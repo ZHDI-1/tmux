@@ -75,6 +75,7 @@ cmd_resize_pane_exec(struct cmd *self, struct cmdq_item *item)
 		adjust = screen_size_y(&wp->base) - 1 - wp->base.cy;
 		if (adjust > (int)gd->hsize)
 			adjust = gd->hsize;
+		pane_io_invalidate(wp);
 		grid_remove_history(gd, adjust);
 		wp->base.cy += adjust;
 		wp->flags |= PANE_REDRAW;

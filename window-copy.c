@@ -80,8 +80,8 @@ static int	window_copy_visible_has_images(struct window_copy_mode_data *);
 static char    *window_copy_match_at_cursor(struct window_copy_mode_data *);
 static void	window_copy_scroll_to(struct window_mode_entry *, u_int, u_int,
 		    int);
-static int	window_copy_search_compare(struct grid *, u_int, u_int,
-		    struct grid *, u_int, int);
+static int	window_copy_search_compare(const struct grid_cell *,
+		     const struct grid_line *, u_int, int);
 static int	window_copy_search_lr(struct grid *, struct grid *, u_int *,
 		    u_int, u_int, u_int, int);
 static int	window_copy_search_rl(struct grid *, struct grid *, u_int *,
@@ -280,21 +280,18 @@ struct window_copy_cmd_state {
  *
  * In either case, the full content of the copy-mode grid is pointed at by the
  * "backing" field, and is copied into "screen" as needed (that is, when
- * scrolling occurs). When copy-mode is backed by a pane, backing points
- * directly at that pane's screen structure (&wp->base); when backed by a list
- * of output-lines from a command, it points at a newly-allocated screen
- * structure (which is deallocated when the mode ends).
+ * scrolling occurs). Copy mode retains a version of the pane grid, while
+ * view mode constructs its own backing screen from command output.
  */
 struct window_copy_mode_data {
+	uint64_t resize_token;
+
 	struct screen	 screen;
 
 	struct screen	*backing;
 	int		 backing_written; /* backing display started */
 	struct input_ctx *ictx;
 
-	u_int		 sync_added;	/* snapshot of backing grid counters */
-	u_int		 sync_collected;
-	u_int		 sync_generation;
 
 	int		 viewmode;	/* view mode entered */
 
@@ -443,18 +440,15 @@ window_copy_clone_screen(struct screen *src, struct screen *hint, u_int *cx,
 	log_debug("%s: target screen is %ux%u, source %ux%u", __func__,
 	    screen_size_x(src), sy, screen_size_x(hint),
 	    screen_hsize(src) + screen_size_y(src));
-	screen_init(dst, screen_size_x(src), sy, screen_hlimit(src));
+	screen_init(dst, screen_size_x(src), 1, screen_hlimit(src));
 
 	/*
 	 * Ensure history is on for the backing grid so lines are not deleted
 	 * during resizing.
 	 */
 	dst->grid->flags |= GRID_HISTORY;
-	grid_duplicate_lines(dst->grid, 0, src->grid, 0, sy);
-
-	dst->grid->sy = sy - screen_hsize(src);
-	dst->grid->hsize = screen_hsize(src);
-	dst->grid->hscrolled = src->grid->hscrolled;
+	grid_share_lines(dst->grid, src->grid);
+	grid_resize_viewport(dst->grid, sy - screen_hsize(src), 0);
 	if (src->cy > dst->grid->sy - 1) {
 		dst->cx = 0;
 		dst->cy = dst->grid->sy - 1;
@@ -480,113 +474,25 @@ window_copy_clone_screen(struct screen *src, struct screen *hint, u_int *cx,
 	return (dst);
 }
 
-/*
- * Snapshot the source grid's monotonic scroll counters so the next incremental
- * sync can tell how much history was added or collected since this point.
- */
-static void
-window_copy_sync_snapshot(struct window_copy_mode_data *data, struct grid *src)
-{
-	data->sync_added = src->scroll_added;
-	data->sync_collected = src->scroll_collected;
-	data->sync_generation = src->scroll_generation;
-}
-
-/*
- * Reconcile the backing screen with the live pane grid in place, copying only
- * the history that scrolled in or was collected since the last snapshot rather
- * than cloning the whole scrollback. The result is identical to a fresh
- * window_copy_clone_screen, so the caller repositions and redraws the same way
- * for both paths. Returns 1 on success, or 0 if the caller must fall back to a
- * full clone (different source pane, geometry or generation change, or counter
- * deltas that do not add up).
- */
+/* The retained history root and small new viewport replace the backing. */
 static int
 window_copy_sync_backing(struct window_mode_entry *wme)
 {
-	struct window_copy_mode_data	*data = wme->data;
-	struct window_pane		*wp = wme->swp;
-	struct screen			*src = &wp->base;
-	struct screen			*dst = data->backing;
-	struct grid			*sg = src->grid;
-	struct grid			*dg = dst->grid;
-	u_int				 sy = sg->sy;
-	u_int				 old_hsize = dg->hsize;
-	u_int				 new_hsize = sg->hsize;
-	u_int				 added, collected, kept;
+	struct window_copy_mode_data *data = wme->data;
+	struct screen *src = &wme->swp->base, *dst = data->backing;
+	struct grid *sg = src->grid, *dg = dst->grid;
 
-	/*
-	 * Only a pane's own live grid is tracked incrementally. A different
-	 * source pane (copy-mode -s) goes through clone_screen, which also
-	 * trims trailing blank lines that this path does not.
-	 */
-	if (data->viewmode || wme->swp != wme->wp)
+	if (data->viewmode || wme->swp != wme->wp ||
+	    sg->sx != dg->sx || sg->sy != dg->sy)
 		return (0);
-
-	/* Indices only line up at the same size and generation. */
-	if (sg->sx != dg->sx || sg->sy != dg->sy ||
-	    sg->scroll_generation != data->sync_generation)
-		return (0);
-
-	added = sg->scroll_added - data->sync_added;
-	collected = sg->scroll_collected - data->sync_collected;
-
-	/*
-	 * Reject anything that does not balance: counter wrap, a history-limit
-	 * change that collected past the snapshot, or arithmetic that does not
-	 * reproduce the new history size.
-	 */
-	if (added > (u_int)INT_MAX || collected > (u_int)INT_MAX ||
-	    collected > old_hsize || old_hsize + added < collected ||
-	    old_hsize + added - collected != new_hsize)
-		return (0);
-
-	kept = old_hsize - collected;
-
-	if (added == 0 && collected == 0) {
-		/* History is unchanged; only the viewport can have mutated. */
-		grid_duplicate_lines(dg, dg->hsize, sg, sg->hsize, sy);
-	} else {
-		/* Drop the oldest lines and shift the rest down. */
-		if (collected > 0) {
-			grid_free_lines(dg, 0, collected);
-			memmove(&dg->linedata[0], &dg->linedata[collected],
-			    (old_hsize + sy - collected) *
-			    sizeof *dg->linedata);
-			memset(&dg->linedata[old_hsize + sy - collected], 0,
-			    collected * sizeof *dg->linedata);
-		}
-
-		/* Resize linedata to the new history plus viewport. */
-		if (new_hsize + sy != old_hsize + sy - collected) {
-			grid_adjust_lines(dg, new_hsize + sy);
-			memset(&dg->linedata[old_hsize + sy - collected], 0,
-			    (new_hsize - kept) * sizeof *dg->linedata);
-		}
-
-		/*
-		 * Set hsize before copying so grid_duplicate_lines does not
-		 * clamp the count to the old, smaller grid size.
-		 */
-		dg->hsize = new_hsize;
-
-		/* Copy the newly scrolled history, then refresh the view. */
-		if (added > 0)
-			grid_duplicate_lines(dg, kept, sg, kept, added);
-		grid_duplicate_lines(dg, new_hsize, sg, new_hsize, sy);
-	}
-
-	dg->hscrolled = sg->hscrolled;
-
-	/* Match clone_screen's backing cursor placement. */
-	if (src->cy > dg->sy - 1) {
+	grid_share_lines(dg, sg);
+	if (src->cy >= dg->sy) {
 		dst->cx = 0;
 		dst->cy = dg->sy - 1;
 	} else {
 		dst->cx = src->cx;
 		dst->cy = src->cy;
 	}
-
 	return (1);
 }
 
@@ -647,7 +553,7 @@ window_copy_init(struct window_mode_entry *wme,
 	data = window_copy_common_init(wme);
 	data->backing = window_copy_clone_screen(base, &data->screen, &cx, &cy,
 	    wme->swp != wme->wp);
-	window_copy_sync_snapshot(data, base->grid);
+
 
 	data->cx = cx;
 	if (cy < screen_hsize(data->backing)) {
@@ -1157,7 +1063,7 @@ window_copy_formats(struct window_mode_entry *wme, struct format_tree *ft)
 	struct window_copy_mode_data	*data = wme->data;
 	u_int				 hsize = screen_hsize(data->backing);
 	u_int				 position, limit;
-	struct grid_line		*gl;
+	const struct grid_line		*gl;
 	time_t				 t;
 
 	gl = grid_get_line(data->backing->grid, hsize - data->oy);
@@ -1268,29 +1174,26 @@ window_copy_size_changed(struct window_mode_entry *wme)
 	data->searcho = data->oy;
 }
 
+static uint64_t window_copy_resize_token;
+
+/* The view may still be navigated while its old backing is published. */
 static void
-window_copy_resize(struct window_mode_entry *wme, u_int sx, u_int sy)
+window_copy_resize_position(struct window_copy_mode_data *data, u_int *cx,
+    u_int *cy)
 {
-	struct window_copy_mode_data	*data = wme->data;
-	struct screen			*s = &data->screen;
-	struct grid			*gd = data->backing->grid;
-	u_int				 cx, cy, wx, wy;
-	int				 reflow;
+	struct grid *gd = data->backing->grid;
 
-	if (screen_size_x(s) == sx && screen_size_y(s) == sy)
-		return;
-
-	screen_resize(s, sx, sy, 0);
-	cx = data->cx;
+	*cx = data->cx;
 	if (data->oy > gd->hsize + data->cy)
 		data->oy = gd->hsize + data->cy;
-	cy = gd->hsize + data->cy - data->oy;
-	reflow = (gd->sx != sx);
-	if (reflow)
-		grid_wrap_position(gd, cx, cy, &wx, &wy);
-	screen_resize_cursor(data->backing, sx, sy, 1, 0, 0);
-	if (reflow)
-		grid_unwrap_position(gd, &cx, &cy, wx, wy);
+	*cy = gd->hsize + data->cy - data->oy;
+}
+
+static void
+window_copy_resize_done(struct window_mode_entry *wme, u_int cx, u_int cy)
+{
+	struct window_copy_mode_data *data = wme->data;
+	struct grid *gd = data->backing->grid;
 
 	data->cx = cx;
 	if (cy < gd->hsize) {
@@ -1300,9 +1203,94 @@ window_copy_resize(struct window_mode_entry *wme, u_int sx, u_int sy)
 		data->cy = cy - gd->hsize;
 		data->oy = 0;
 	}
-
 	window_copy_size_changed(wme);
 	window_copy_redraw_screen(wme);
+}
+
+static void
+window_copy_resize_now(struct window_mode_entry *wme, u_int sx, u_int sy)
+{
+	struct window_copy_mode_data *data = wme->data;
+	struct grid *gd = data->backing->grid;
+	u_int cx, cy, wx, wy;
+	int reflow = (gd->sx != sx);
+
+	data->resize_token = 0;
+	screen_resize(&data->screen, sx, sy, 0);
+	window_copy_resize_position(data, &cx, &cy);
+	if (reflow)
+		grid_wrap_position(gd, cx, cy, &wx, &wy);
+	screen_resize_cursor(data->backing, sx, sy, 1, 0, 0);
+	if (reflow)
+		grid_unwrap_position(gd, &cx, &cy, wx, wy);
+	window_copy_resize_done(wme, cx, cy);
+}
+
+static void
+window_copy_resize(struct window_mode_entry *wme, u_int sx, u_int sy)
+{
+	struct window_copy_mode_data *data = wme->data;
+	struct grid *gd = data->backing->grid;
+
+	if (screen_size_x(&data->screen) == sx &&
+	    screen_size_y(&data->screen) == sy) {
+		/* A return to the published size supersedes pending work. */
+		data->resize_token = 0;
+		return;
+	}
+	if (grid_worker_eligible(gd) && gd->hsize >= 4096 && gd->sx != sx &&
+	    pane_io_resize_copy(wme->wp))
+		return;
+	window_copy_resize_now(wme, sx, sy);
+}
+
+int
+window_copy_worker_submit(struct window_pane *wp, struct pane_worker *worker)
+{
+	struct window_mode_entry *wme = TAILQ_FIRST(&wp->modes);
+	struct window_copy_mode_data *data;
+	u_int cx, cy;
+
+	if (wme == NULL || wme->mode->resize != window_copy_resize)
+		return (0);
+	data = wme->data;
+	if (screen_size_x(&data->screen) == wp->sx &&
+	    screen_size_y(&data->screen) == wp->sy)
+		return (0);
+	window_copy_resize_position(data, &cx, &cy);
+	if (++window_copy_resize_token == 0)
+		window_copy_resize_token++;
+	data->resize_token = window_copy_resize_token;
+	if (pane_worker_submit_copy(worker, data->backing, wp->sx, wp->sy,
+	    cx, cy, data->resize_token))
+		return (1);
+	window_copy_resize_now(wme, wp->sx, wp->sy);
+	return (0);
+}
+
+int
+window_copy_worker_finish(struct window_pane *wp, struct pane_work *work)
+{
+	struct window_mode_entry *wme = TAILQ_FIRST(&wp->modes);
+	struct window_copy_mode_data *data;
+	u_int cx, cy;
+
+	if (wme == NULL || wme->mode->resize != window_copy_resize)
+		goto discard;
+	data = wme->data;
+	if (data->resize_token != pane_worker_copy_token(work))
+		goto discard;
+	data->resize_token = 0;
+	window_copy_resize_position(data, &cx, &cy);
+	pane_worker_apply_copy(work, data->backing, &cx, &cy);
+	screen_resize(&data->screen, screen_size_x(data->backing),
+	    screen_size_y(data->backing), 0);
+	window_copy_resize_done(wme, cx, cy);
+	return (1);
+
+discard:
+	pane_worker_discard(work);
+	return (0);
 }
 
 static const char *
@@ -2159,7 +2147,7 @@ window_copy_cmd_next_matching_bracket(struct window_copy_cmd_state *cs)
 	u_int				 px, py, xx, yy, sx, sy, n;
 	struct grid_cell		 gc;
 	int				 failed;
-	struct grid_line		*gl;
+	const struct grid_line		*gl;
 
 	for (; np != 0; np--) {
 		/* Get cursor position and line length. */
@@ -3308,6 +3296,9 @@ window_copy_do_refresh(struct window_mode_entry *wme, int follow)
 	struct window_copy_mode_data	*data = wme->data;
 	u_int				 oy_from_top;
 
+	if (data->resize_token != 0)
+		return; /* Retry on the next refresh tick after publication. */
+
 	if (data->oy > screen_hsize(data->backing))
 		data->oy = screen_hsize(data->backing);
 	oy_from_top = screen_hsize(data->backing) - data->oy;
@@ -3331,7 +3322,6 @@ window_copy_do_refresh(struct window_mode_entry *wme, int follow)
 		data->oy = screen_hsize(data->backing);
 	}
 
-	window_copy_sync_snapshot(data, wp->base.grid);
 	window_copy_size_changed(wme);
 }
 
@@ -4364,18 +4354,16 @@ window_copy_scroll_to(struct window_mode_entry *wme, u_int px, u_int py,
 }
 
 static int
-window_copy_search_compare(struct grid *gd, u_int px, u_int py,
-    struct grid *sgd, u_int spx, int cis)
+window_copy_search_compare(const struct grid_cell *gc,
+    const struct grid_line *needle, u_int spx, int cis)
 {
-	struct grid_cell	 gc, sgc;
-	const struct utf8_data	*ud, *sud;
+	struct grid_cell	 sgc;
+	const struct utf8_data	*ud = &gc->data, *sud;
 
-	grid_get_cell(gd, px, py, &gc);
-	ud = &gc.data;
-	grid_get_cell(sgd, spx, 0, &sgc);
+	grid_line_get_cell(needle, spx, &sgc);
 	sud = &sgc.data;
 
-	if (*sud->data == '\t' && sud->size == 1 && gc.flags & GRID_FLAG_TAB)
+	if (*sud->data == '\t' && sud->size == 1 && gc->flags & GRID_FLAG_TAB)
 		return (1);
 
 	if (ud->size != sud->size || ud->width != sud->width)
@@ -4392,19 +4380,28 @@ window_copy_search_lr(struct grid *gd, struct grid *sgd, u_int *ppx, u_int py,
     u_int first, u_int last, int cis)
 {
 	u_int			 ax, bx, px, pywrap, endline, padding;
+	u_int			 row;
 	int			 matched;
-	struct grid_line	*gl;
+	const struct grid_line	*gl, *first_row = grid_get_line(gd, py);
+	const struct grid_line	*needle = grid_get_line(sgd, 0);
+	struct grid_row_cursor	 reader = { 0 };
 	struct grid_cell	 gc;
 
 	endline = gd->hsize + gd->sy - 1;
 	for (ax = first; ax < last; ax++) {
 		padding = 0;
+		row = py;
+		gl = first_row;
 		for (bx = 0; bx < sgd->sx; bx++) {
 			px = ax + bx + padding;
 			pywrap = py;
 			/* Wrap line. */
 			while (px >= gd->sx && pywrap < endline) {
-				gl = grid_get_line(gd, pywrap);
+				if (pywrap != row) {
+					row = pywrap;
+					gl = row == py ? first_row :
+					    grid_read_line(gd, &reader, row);
+				}
 				if (~gl->flags & GRID_LINE_WRAPPED)
 					break;
 				px -= gd->sx;
@@ -4414,12 +4411,16 @@ window_copy_search_lr(struct grid *gd, struct grid *sgd, u_int *ppx, u_int py,
 			if (px - padding >= gd->sx)
 				break;
 
-			grid_get_cell(gd, px, pywrap, &gc);
+			if (pywrap != row) {
+				row = pywrap;
+				gl = row == py ? first_row :
+				    grid_read_line(gd, &reader, row);
+			}
+			grid_line_get_cell(gl, px, &gc);
 			if (gc.flags & GRID_FLAG_TAB)
 				padding += gc.data.width - 1;
 
-			matched = window_copy_search_compare(gd, px, pywrap,
-			    sgd, bx, cis);
+			matched = window_copy_search_compare(&gc, needle, bx, cis);
 			if (!matched)
 				break;
 		}
@@ -4436,19 +4437,28 @@ window_copy_search_rl(struct grid *gd,
     struct grid *sgd, u_int *ppx, u_int py, u_int first, u_int last, int cis)
 {
 	u_int			 ax, bx, px, pywrap, endline, padding;
+	u_int			 row;
 	int			 matched;
-	struct grid_line	*gl;
+	const struct grid_line	*gl, *first_row = grid_get_line(gd, py);
+	const struct grid_line	*needle = grid_get_line(sgd, 0);
+	struct grid_row_cursor	 reader = { 0 };
 	struct grid_cell	 gc;
 
 	endline = gd->hsize + gd->sy - 1;
 	for (ax = last; ax > first; ax--) {
 		padding = 0;
+		row = py;
+		gl = first_row;
 		for (bx = 0; bx < sgd->sx; bx++) {
 			px = ax - 1 + bx + padding;
 			pywrap = py;
 			/* Wrap line. */
 			while (px >= gd->sx && pywrap < endline) {
-				gl = grid_get_line(gd, pywrap);
+				if (pywrap != row) {
+					row = pywrap;
+					gl = row == py ? first_row :
+					    grid_read_line(gd, &reader, row);
+				}
 				if (~gl->flags & GRID_LINE_WRAPPED)
 					break;
 				px -= gd->sx;
@@ -4458,12 +4468,16 @@ window_copy_search_rl(struct grid *gd,
 			if (px - padding >= gd->sx)
 				break;
 
-			grid_get_cell(gd, px, pywrap, &gc);
+			if (pywrap != row) {
+				row = pywrap;
+				gl = row == py ? first_row :
+				    grid_read_line(gd, &reader, row);
+			}
+			grid_line_get_cell(gl, px, &gc);
 			if (gc.flags & GRID_FLAG_TAB)
 				padding += gc.data.width - 1;
 
-			matched = window_copy_search_compare(gd, px, pywrap,
-			    sgd, bx, cis);
+			matched = window_copy_search_compare(&gc, needle, bx, cis);
 			if (!matched)
 				break;
 		}
@@ -4483,7 +4497,7 @@ window_copy_search_lr_regex(struct grid *gd, u_int *ppx, u_int *psx, u_int py,
 	u_int			endline, foundx, foundy, len, pywrap, size = 1;
 	char		       *buf;
 	regmatch_t		regmatch;
-	struct grid_line       *gl;
+	const struct grid_line       *gl;
 
 	/*
 	 * This can happen during search if the last match was the last
@@ -4549,7 +4563,7 @@ window_copy_search_rl_regex(struct grid *gd, u_int *ppx, u_int *psx, u_int py,
 	int			eflags = 0;
 	u_int			endline, len, pywrap, size = 1;
 	char		       *buf;
-	struct grid_line       *gl;
+	const struct grid_line       *gl;
 
 	/* Set flags for regex search. */
 	if (first != 0)
@@ -5932,7 +5946,8 @@ window_copy_write_line(struct window_mode_entry *wme,
 	    content_sx, &mgc, &cgc, &mkgc, &clgc);
 
 #ifdef ENABLE_IMAGES
-	image_grid_free_line(s->grid, &s->grid->linedata[s->grid->hsize + py]);
+	if (s->grid->images != NULL)
+		image_grid_free_line(s->grid, s->grid->hsize + py);
 	image_grid_copy_area(s->grid, width, s->grid->hsize + py,
 	    data->backing->grid, 0, hsize - data->oy + py, content_sx, 1);
 	if (data->image_refresh)
@@ -6803,7 +6818,7 @@ window_copy_copy_line_length(struct window_mode_entry *wme, u_int sy,
 {
 	struct window_copy_mode_data	*data = wme->data;
 	struct grid			*gd = data->backing->grid;
-	struct grid_line		*gl = grid_get_line(gd, sy);
+	const struct grid_line		*gl = grid_get_line(gd, sy);
 	u_int				 length;
 	int				 line_wrapped;
 
@@ -6841,8 +6856,10 @@ window_copy_copy_line(struct window_mode_entry *wme, char **buf, size_t *off,
 		sx = xx;
 
 	if (sx < ex) {
+		const struct grid_line *gl = grid_get_line(gd, sy);
+
 		for (i = sx; i < ex; i++) {
-			grid_get_cell(gd, i, sy, &gc);
+			grid_line_get_cell(gl, i, &gc);
 			if (gc.flags & GRID_FLAG_PADDING)
 				continue;
 			if (gc.flags & GRID_FLAG_TAB)

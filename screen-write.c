@@ -63,27 +63,55 @@ struct screen_write_sync_range {
 	u_int	first;
 	u_int	last;
 };
-TAILQ_HEAD(, screen_write_citem)  screen_write_citem_freelist =
+static TAILQ_HEAD(screen_write_free_items, screen_write_citem)
+    screen_write_citem_freelist =
     TAILQ_HEAD_INITIALIZER(screen_write_citem_freelist);
+
+static __thread struct screen_write_free_items screen_write_worker_items;
+
+static struct screen_write_free_items *
+screen_write_free_items(void)
+{
+	if (!pane_worker_thread)
+		return (&screen_write_citem_freelist);
+	if (screen_write_worker_items.tqh_last == NULL)
+		TAILQ_INIT(&screen_write_worker_items);
+	return (&screen_write_worker_items);
+}
 
 static struct screen_write_citem *
 screen_write_get_citem(void)
 {
-    struct screen_write_citem	*ci;
+	struct screen_write_free_items *items = screen_write_free_items();
+	struct screen_write_citem *ci;
 
-    ci = TAILQ_FIRST(&screen_write_citem_freelist);
-    if (ci != NULL) {
-	    TAILQ_REMOVE(&screen_write_citem_freelist, ci, entry);
-	    memset(ci, 0, sizeof *ci);
-	    return (ci);
-    }
-    return (xcalloc(1, sizeof *ci));
+	ci = TAILQ_FIRST(items);
+	if (ci != NULL) {
+		TAILQ_REMOVE(items, ci, entry);
+		memset(ci, 0, sizeof *ci);
+		return (ci);
+	}
+	return (xcalloc(1, sizeof *ci));
 }
 
 static void
 screen_write_free_citem(struct screen_write_citem *ci)
 {
-	TAILQ_INSERT_TAIL(&screen_write_citem_freelist, ci, entry);
+	struct screen_write_free_items *items = screen_write_free_items();
+
+	TAILQ_INSERT_TAIL(items, ci, entry);
+}
+
+void
+screen_write_worker_cleanup(void)
+{
+	struct screen_write_free_items *items = screen_write_free_items();
+	struct screen_write_citem *ci;
+
+	while ((ci = TAILQ_FIRST(items)) != NULL) {
+		TAILQ_REMOVE(items, ci, entry);
+		free(ci);
+	}
 }
 
 /* Keep conservative bounds on lines with collected items. */
@@ -329,7 +357,8 @@ screen_write_should_draw_lines(struct screen_write_ctx *ctx, u_int y, u_int ny)
 	struct screen		*s = ctx->s;
 	u_int			 sy = screen_size_y(s);
 
-	if (wp != NULL && (wp->flags & (PANE_REDRAW|PANE_DROP)))
+	if ((ctx->flags & SCREEN_WRITE_HEADLESS) ||
+	    (wp != NULL && (wp->flags & (PANE_REDRAW|PANE_DROP))))
 		return (0);
 	if (s->mode & MODE_SYNC) {
 		if (wp != NULL && y < sy && ny != 0) {
@@ -444,6 +473,7 @@ screen_write_free_list(struct screen *s)
 		free(cl->data);
 	}
 	free(s->write_list);
+	s->write_list = NULL;
 }
 
 /* Set up for writing. */
@@ -771,7 +801,7 @@ screen_write_fast_copy(struct screen_write_ctx *ctx, struct screen *src,
 	struct window_pane	*wp = ctx->wp;
 	struct tty_ctx		 ttyctx;
 	struct grid		*gd = src->grid;
-	struct grid_line	*gl, *sgl;
+	const struct grid_line *gl, *sgl;
 	struct grid_cell	 gc;
 	u_int			 xx, yy, cx = s->cx, cy = s->cy;
 	int			 xoff = 0, yoff = 0;
@@ -1283,7 +1313,7 @@ void
 screen_write_backspace(struct screen_write_ctx *ctx)
 {
 	struct screen		*s = ctx->s;
-	struct grid_line	*gl;
+	const struct grid_line	*gl;
 	u_int			 cx = s->cx, cy = s->cy;
 
 	if (cx == 0) {
@@ -1356,7 +1386,7 @@ screen_write_redraw_range(struct screen_write_ctx *ctx, struct tty_ctx *ttyctx,
 
 #ifdef ENABLE_IMAGES
 		/* Even one cell may need the image backend's text mapping. */
-		if (s->grid->linedata[s->grid->hsize + yy].images != NULL) {
+		if (image_grid_line_has_images(s->grid, s->grid->hsize + yy)) {
 			tty_write(tty_cmd_redrawline, ttyctx);
 			continue;
 		}
@@ -1423,6 +1453,18 @@ screen_write_sync_flush_dirty(struct window_pane *wp)
 
 	screen_write_stop(&ctx);
 	screen_write_sync_clear_dirty(wp);
+}
+
+/* A worker published a new screen during synchronized output. */
+void
+screen_write_sync_worker_dirty(struct window_pane *wp)
+{
+	struct screen *s = &wp->base;
+	u_int sy = screen_size_y(s);
+
+	screen_write_sync_allocate_dirty(wp, screen_size_x(s), sy);
+	screen_write_sync_set_dirty(wp, 0, sy - 1);
+	wp->sync_scrolled = 0;
 }
 
 /* Clear pending synchronized output. */
@@ -1862,10 +1904,10 @@ screen_write_clearline(struct screen_write_ctx *ctx, u_int bg)
 	struct osc133_data		 od;
 	u_int				 flags;
 
-	gl = grid_get_line(s->grid, s->grid->hsize + s->cy);
+	gl = grid_edit_line_record(s->grid, s->grid->hsize + s->cy);
 	if (gl->cellsize == 0 && COLOUR_DEFAULT(bg)) {
 #ifdef ENABLE_IMAGES
-		if (!image_grid_line_has_images(gl))
+		if (!image_grid_line_has_images(s->grid, s->grid->hsize + s->cy))
 			return;
 #else
 		return;
@@ -1879,7 +1921,7 @@ screen_write_clearline(struct screen_write_ctx *ctx, u_int bg)
 	flags = gl->flags & GRID_LINE_OSC133_FLAGS;
 	memcpy(&od, &gl->osc133_data, sizeof od);
 	grid_view_clear(s->grid, 0, s->cy, sx, 1, bg);
-	gl = grid_get_line(s->grid, s->grid->hsize + s->cy);
+	gl = grid_edit_line_record(s->grid, s->grid->hsize + s->cy);
 	gl->flags |= flags;
 	memcpy(&gl->osc133_data, &od, sizeof gl->osc133_data);
 
@@ -1898,7 +1940,7 @@ void
 screen_write_clearendofline(struct screen_write_ctx *ctx, u_int bg)
 {
 	struct screen			*s = ctx->s;
-	struct grid_line		*gl;
+	const struct grid_line		*gl;
 	u_int				 sx = screen_size_x(s);
 	struct screen_write_citem	*ci = ctx->item;
 
@@ -2086,9 +2128,10 @@ screen_write_linefeed(struct screen_write_ctx *ctx, int wrapped, u_int bg)
 	struct grid_line	*gl;
 	u_int			 rupper = s->rupper, rlower = s->rlower;
 
-	gl = grid_get_line(gd, gd->hsize + s->cy);
-	if (wrapped)
+	if (wrapped) {
+		gl = grid_edit_line_record(gd, gd->hsize + s->cy);
 		gl->flags |= GRID_LINE_WRAPPED;
+	}
 
 	log_debug("%s: at %u,%u (region %u-%u)", __func__, s->cx, s->cy,
 	    rupper, rlower);
@@ -2212,8 +2255,9 @@ screen_write_clearendofscreen(struct screen_write_ctx *ctx, u_int bg)
 	if (s->cx == 0 &&
 	    s->cy == 0 &&
 	    (gd->flags & GRID_HISTORY) &&
-	    ctx->wp != NULL &&
-	    options_get_number(ctx->wp->options, "scroll-on-clear"))
+	    ((ctx->flags & SCREEN_WRITE_SCROLL_ON_CLEAR) ||
+	    (ctx->wp != NULL &&
+	    options_get_number(ctx->wp->options, "scroll-on-clear"))))
 		grid_view_clear_history(gd, bg);
 	else {
 		if (s->cx <= sx - 1)
@@ -2368,9 +2412,10 @@ screen_write_clearscreen(struct screen_write_ctx *ctx, u_int bg)
 		grid_view_clear_history(s->grid, bg);
 	else {
 #ifdef ENABLE_IMAGES
-		for (y = 0; y < sy; y++) {
-			image_grid_free_line(s->grid,
-			    &s->grid->linedata[s->grid->hsize + y]);
+		if (s->grid->images != NULL) {
+			for (y = 0; y < sy; y++) {
+				image_grid_free_line(s->grid, s->grid->hsize + y);
+			}
 		}
 #endif
 		grid_view_clear(s->grid, 0, 0, sx, sy, bg);
@@ -2531,7 +2576,7 @@ screen_write_collect_clear(struct screen_write_ctx *ctx, u_int y, u_int n)
 
 	for (i = y; i < y + n; i++) {
 		cl = &ctx->s->write_list[i];
-		TAILQ_CONCAT(&screen_write_citem_freelist, &cl->items, entry);
+		TAILQ_CONCAT(screen_write_free_items(), &cl->items, entry);
 	}
 }
 
@@ -2701,7 +2746,7 @@ screen_write_collect_flush_line(struct screen_write_ctx *ctx, u_int y)
 		return (0);
 
 	r = window_visible_ranges(wp, 0, y + yoff, wsx, NULL);
-	if (!log_debug_enabled && wp != NULL &&
+	if (!log_debug_active() && wp != NULL &&
 	    ctx->init_ctx_cb == NULL && r->used == 1 &&
 	    r->ranges[0].px <= (u_int)xoff &&
 	    r->ranges[0].px + r->ranges[0].nx >= (u_int)xoff + screen_size_x(s) &&
@@ -2788,7 +2833,8 @@ screen_write_collect_flush(struct screen_write_ctx *ctx, int scroll_only,
 	struct screen_write_citem	*ci, *tmp;
 	struct screen_write_cline	*cl;
 
-	if (wp != NULL && (wp->flags & (PANE_REDRAW|PANE_DROP)))
+	if ((ctx->flags & SCREEN_WRITE_HEADLESS) ||
+	    (wp != NULL && (wp->flags & (PANE_REDRAW|PANE_DROP))))
 		goto discard;
 	if (s->mode & MODE_SYNC) {
 		if (ctx->scrolled != 0)
@@ -3073,7 +3119,7 @@ screen_write_collect_lines(struct screen_write_ctx *ctx,
 		}
 		grid_free_lines(gd, py, height);
 		if (py != 0)
-			gd->linedata[py - 1].flags &= ~GRID_LINE_WRAPPED;
+			grid_clear_wrapped(gd, py - 1);
 		memcpy(&cell, gc, sizeof cell);
 		utf8_set(&cell.data, ' ');
 		for (y = s->rupper; y <= s->rlower; y++) {
@@ -3290,7 +3336,7 @@ screen_write_cell1(struct screen_write_ctx *ctx, const struct grid_cell *gc,
 	struct window_pane	*wp = ctx->wp;
 	struct grid		*gd = s->grid;
 	const struct utf8_data	*ud = &gc->data;
-	struct grid_line	*gl;
+	const struct grid_line	*gl;
 	struct grid_cell_entry	*gce;
 	struct grid_cell	 tmp_gc;
 	struct tty_ctx		 ttyctx;

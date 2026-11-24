@@ -35,8 +35,8 @@ static char	*cmd_capture_pane_pending(struct args *, struct window_pane *,
 		     size_t *);
 static char	*cmd_capture_pane_history(struct args *, struct cmdq_item *,
 		     struct window_pane *, size_t *);
-static char	*cmd_capture_pane_hyperlinks(struct grid *, struct screen *,
-		     u_int, u_int *, u_int *, size_t *);
+static char	*cmd_capture_pane_hyperlinks(const struct grid_line *,
+		     struct screen *, u_int *, u_int *, size_t *);
 
 const struct cmd_entry cmd_capture_pane_entry = {
 	.name = "capture-pane",
@@ -94,9 +94,9 @@ cmd_capture_pane_append(char *buf, size_t *len, size_t *capacity,
 }
 
 static char *
-cmd_capture_pane_cell(struct screen *s, u_int xx, u_int yy)
+cmd_capture_pane_cell(struct screen *s, const struct grid_line *gl,
+    u_int xx, u_int yy)
 {
-	struct grid *gd = s->grid;
 	struct hyperlinks *hl = s->hyperlinks;
 	struct grid_cell gc;
 	char *line, *data, *link, *linkid, *f, *b, *u;
@@ -104,7 +104,7 @@ cmd_capture_pane_cell(struct screen *s, u_int xx, u_int yy)
 	const char		*uri, *iid;
 	u_int			 flags;
 
-	grid_get_cell(gd, xx, yy, &gc);
+	grid_line_get_cell(gl, xx, &gc);
 
 	memcpy(c, gc.data.data, gc.data.size);
 	c[gc.data.size] = '\0';
@@ -152,8 +152,9 @@ cmd_capture_pane_grid(struct window_pane *wp, size_t *len)
 	size_t capacity = 1;
 	struct screen		*s = &wp->base;
 	struct grid		*gd = s->grid;
-	struct grid_line	*gl;
-	struct osc133_data	*od;
+	const struct grid_line	*gl;
+	struct grid_row_cursor	 reader = { 0 };
+	const struct osc133_data	*od;
 	char			*buf = xstrdup(""), *line;
 	char			 p[11];
 	u_int			 yy, xx, total = gd->hsize + gd->sy;
@@ -164,7 +165,7 @@ cmd_capture_pane_grid(struct window_pane *wp, size_t *len)
 	free(line);
 
 	for (yy = 0; yy < total; yy++) {
-		gl = grid_get_line(gd, yy);
+		gl = grid_read_line(gd, &reader, yy);
 		if (yy < gd->hsize)
 			snprintf(p, sizeof p, "-");
 		else
@@ -187,7 +188,7 @@ cmd_capture_pane_grid(struct window_pane *wp, size_t *len)
 		free(line);
 
 		for (xx = 0; xx < gd->sx; xx++) {
-			line = cmd_capture_pane_cell(s, xx, yy);
+			line = cmd_capture_pane_cell(s, gl, xx, yy);
 			buf = cmd_capture_pane_append(buf, len, &capacity, line,
 			    strlen(line));
 			free(line);
@@ -230,11 +231,10 @@ cmd_capture_pane_pending(struct args *args, struct window_pane *wp,
 }
 
 static char *
-cmd_capture_pane_hyperlinks(struct grid *gd, struct screen *s, u_int py,
+cmd_capture_pane_hyperlinks(const struct grid_line *gl, struct screen *s,
     u_int *links, u_int *nlinks, size_t *len)
 {
 	size_t capacity = 1;
-	const struct grid_line	*gl = grid_peek_line(gd, py);
 	struct grid_cell	 gc;
 	const char		*uri;
 	char			*line = xstrdup("");
@@ -246,7 +246,7 @@ cmd_capture_pane_hyperlinks(struct grid *gd, struct screen *s, u_int py,
 		return (line);
 
 	for (i = 0; i < gl->cellused; i++) {
-		grid_get_cell(gd, i, py, &gc);
+		grid_line_get_cell(gl, i, &gc);
 		if (gc.link == 0)
 			continue;
 		for (j = 0; j < *nlinks; j++) {
@@ -259,7 +259,7 @@ cmd_capture_pane_hyperlinks(struct grid *gd, struct screen *s, u_int py,
 		if (!hyperlinks_get(s->hyperlinks, gc.link, &uri, NULL, NULL))
 			continue;
 
-		if (*nlinks == gd->sx)
+		if (*nlinks == screen_size_x(s))
 			break;
 		links[(*nlinks)++] = gc.link;
 
@@ -277,6 +277,7 @@ cmd_capture_pane_history(struct args *args, struct cmdq_item *item,
 	size_t capacity = 0;
 	struct grid			*gd;
 	const struct grid_line		*gl;
+	struct grid_row_cursor reader = { 0 };
 	struct screen			*s;
 	struct grid_cell		*gc = NULL;
 	struct window_mode_entry	*wme;
@@ -370,18 +371,18 @@ cmd_capture_pane_history(struct args *args, struct cmdq_item *item,
 		links = xreallocarray(NULL, gd->sx, sizeof *links);
 
 	for (i = top; i <= bottom; i++) {
+		gl = grid_read_line(gd, &reader, i);
 		if (hyperlinks) {
-			line = cmd_capture_pane_hyperlinks(gd, s, i, links,
+			line = cmd_capture_pane_hyperlinks(gl, s, links,
 			    &nlinks, &linelen);
 		} else {
-			line = grid_string_cells(gd, 0, i, sx, &gc, flags, s);
+			line = grid_string_line(gl, 0, sx, &gc, flags, s);
 			linelen = strlen(line);
 		}
 		if (hyperlinks && linelen == 0) {
 			free(line);
 			continue;
 		}
-		gl = grid_peek_line(gd, i);
 
 		if (number_lines) {
 			if (i >= gd->hsize)
@@ -445,6 +446,7 @@ cmd_capture_pane_exec(struct cmd *self, struct cmdq_item *item)
 
 	if (cmd_get_entry(self) == &cmd_clear_history_entry) {
 		window_pane_reset_mode_all(wp);
+		pane_io_invalidate(wp);
 		grid_clear_history(wp->base.grid);
 		if (args_has(args, 'H'))
 			screen_reset_hyperlinks(wp->screen);

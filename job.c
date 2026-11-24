@@ -27,6 +27,12 @@
 #include <string.h>
 #include <unistd.h>
 
+#if defined(HAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCHDIR_NP) && \
+    defined(HAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCLOSEFROM_NP)
+#include <spawn.h>
+#define JOB_HAVE_SPAWN
+#endif
+
 #include "tmux.h"
 
 /*
@@ -66,6 +72,93 @@ struct job {
 
 /* All jobs list. */
 static LIST_HEAD(joblist, job) all_jobs = LIST_HEAD_INITIALIZER(all_jobs);
+
+#ifdef JOB_HAVE_SPAWN
+/* Build child state on main, so spawning never runs a tmux callback. */
+static int
+job_spawn_shell(pid_t *pid, const char *shell, char *argv0, const char *cmd,
+    struct environ *env, const char *cwd, int fd, int flags,
+    const sigset_t *mask)
+{
+	posix_spawn_file_actions_t actions;
+	posix_spawnattr_t attributes;
+	struct environ_entry *entry;
+	char **envp, *argv[] = { argv0, "-c", (char *)cmd, NULL };
+	const char *dirs[] = { cwd, NULL, "/" };
+	int signals[] = { SIGPIPE, SIGTSTP, SIGINT, SIGQUIT, SIGHUP, SIGCHLD,
+	    SIGCONT, SIGTERM, SIGUSR1, SIGUSR2, SIGWINCH };
+	sigset_t defaults;
+	size_t count;
+	u_int i, j;
+	int err;
+
+	if (flags & JOB_DEFAULTSHELL)
+		environ_set(env, "SHELL", 0, "%s", shell);
+	sigemptyset(&defaults);
+	for (i = 0; i < nitems(signals); i++)
+		sigaddset(&defaults, signals[i]);
+	if ((err = posix_spawnattr_init(&attributes)) != 0)
+		return (err);
+	err = posix_spawnattr_setsigdefault(&attributes, &defaults);
+	if (err == 0)
+		err = posix_spawnattr_setsigmask(&attributes, mask);
+	if (err == 0)
+		err = posix_spawnattr_setflags(&attributes,
+		    POSIX_SPAWN_SETSIGMASK|POSIX_SPAWN_SETSIGDEF);
+	if (err != 0)
+		goto done;
+
+	for (i = 0; i < (cwd != NULL ? nitems(dirs) : 1); i++) {
+		if (i == 1)
+			dirs[i] = find_home();
+		if (cwd != NULL && dirs[i] == NULL)
+			continue;
+		if ((err = posix_spawn_file_actions_init(&actions)) != 0)
+			break;
+		if (dirs[i] != NULL) {
+			err = posix_spawn_file_actions_addchdir_np(&actions, dirs[i]);
+			environ_set(env, "PWD", 0, "%s", dirs[i]);
+		}
+		if (err == 0)
+			err = posix_spawn_file_actions_adddup2(&actions, fd, STDIN_FILENO);
+		if (err == 0)
+			err = posix_spawn_file_actions_adddup2(&actions, fd, STDOUT_FILENO);
+		if (err == 0 && (flags & JOB_SHOWSTDERR))
+			err = posix_spawn_file_actions_adddup2(&actions, fd, STDERR_FILENO);
+		else if (err == 0)
+			err = posix_spawn_file_actions_addopen(&actions, STDERR_FILENO,
+			    _PATH_DEVNULL, O_RDWR, 0);
+		if (err == 0)
+			err = posix_spawn_file_actions_addclosefrom_np(&actions,
+			    STDERR_FILENO + 1);
+		if (err == 0) {
+			count = 0;
+			for (entry = environ_first(env); entry != NULL;
+			    entry = environ_next(entry))
+				count++;
+			envp = xcalloc(count + 1, sizeof *envp);
+			j = 0;
+			for (entry = environ_first(env); entry != NULL;
+			    entry = environ_next(entry)) {
+				if (entry->value != NULL && *entry->name != '\0' &&
+				    (~entry->flags & ENVIRON_HIDDEN))
+					xasprintf(&envp[j++], "%s=%s", entry->name, entry->value);
+			}
+			err = posix_spawn(pid, shell, &actions, &attributes, argv, envp);
+			while (j > 0)
+				free(envp[--j]);
+			free(envp);
+		}
+		posix_spawn_file_actions_destroy(&actions);
+		if (err != ENOENT && err != ENOTDIR && err != EACCES)
+			break;
+	}
+
+done:
+	posix_spawnattr_destroy(&attributes);
+	return (err);
+}
+#endif
 
 /* Start a job running. */
 struct job *
@@ -117,7 +210,15 @@ job_run(const char *cmd, int argc, char **argv, struct environ *e,
 	} else {
 		if (socketpair(AF_UNIX, SOCK_STREAM, PF_UNSPEC, out) != 0)
 			goto fail;
-		pid = fork();
+#ifdef JOB_HAVE_SPAWN
+		if (cmd != NULL) {
+			errno = job_spawn_shell(&pid, shell, argv0, cmd, env, cwd,
+			    out[1], flags, &oldset);
+			if (errno != 0)
+				pid = -1;
+		} else
+#endif
+			pid = fork();
 	}
 	if (cmd == NULL) {
 		cmd_log_argv(argc, argv, "%s:", __func__);

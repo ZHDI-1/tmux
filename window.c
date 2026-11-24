@@ -1759,6 +1759,32 @@ window_pane_read_callback(struct bufferevent *bufev, void *data)
 	bufferevent_disable(wp->event, EV_READ);
 }
 
+int
+window_pane_io_direct(struct window_pane *wp)
+{
+	struct client *c;
+
+	if (wp->pipe_fd != -1 || EVBUFFER_LENGTH(wp->input) != 0 ||
+	    wp->offset.used != wp->base_offset)
+		return (0);
+	TAILQ_FOREACH(c, &clients, entry) {
+		if (c->session != NULL && (c->flags & CLIENT_CONTROL))
+			return (0);
+	}
+	return (1);
+}
+
+void
+window_pane_io_advance(struct window_pane *wp, size_t size)
+{
+	wp->last_output_time = time(NULL);
+	/* No retained consumers: advance the empty-buffer coordinate together. */
+	if (wp->base_offset > SIZE_MAX - size)
+		wp->base_offset = 0;
+	wp->base_offset += size;
+	wp->offset.used = wp->base_offset;
+}
+
 /* Called only on the main event loop; borrowed bytes survive until return. */
 void
 window_pane_io_data(struct window_pane *wp, const u_char *a, size_t na,
@@ -1767,25 +1793,13 @@ window_pane_io_data(struct window_pane *wp, const u_char *a, size_t na,
 	struct client *c;
 	void *data;
 	size_t size;
-	int controls = 0;
 
-	TAILQ_FOREACH(c, &clients, entry) {
-		if (c->session != NULL && (c->flags & CLIENT_CONTROL)) {
-			controls = 1;
-			break;
-		}
-	}
-	wp->last_output_time = time(NULL);
-	if (!controls && wp->pipe_fd == -1 && EVBUFFER_LENGTH(wp->input) == 0 &&
-	    wp->offset.used == wp->base_offset) {
+	if (window_pane_io_direct(wp)) {
 		input_parse_buffers(wp, a, na, b, nb);
-		/* No retained consumers: advance the empty-buffer coordinate together. */
-		if (wp->base_offset > SIZE_MAX - na - nb)
-			wp->base_offset = 0;
-		wp->base_offset += na + nb;
-		wp->offset.used = wp->base_offset;
+		window_pane_io_advance(wp, na + nb);
 		return;
 	}
+	wp->last_output_time = time(NULL);
 	/* Preserve existing independent offsets for pipe/control consumers. */
 	if (evbuffer_add(wp->input, a, na) != 0 ||
 	    (nb != 0 && evbuffer_add(wp->input, b, nb) != 0))
@@ -1885,11 +1899,14 @@ window_pane_resize(struct window_pane *wp, u_int sx, u_int sy)
 	wp->sy = sy;
 
 	log_debug("%s: %%%u resize %ux%u", __func__, wp->id, sx, sy);
-	screen_resize(&wp->base, sx, sy, wp->base.saved_grid == NULL);
+	if (!pane_io_resize(wp)) {
+		pane_io_invalidate(wp);
+		screen_resize(&wp->base, sx, sy, wp->base.saved_grid == NULL);
 #ifdef ENABLE_IMAGES
-	if (sx > r->osx)
-		image_grid_resize_width(wp->base.grid, sx);
+		if (sx > r->osx)
+			image_grid_resize_width(wp->base.grid, sx);
 #endif
+	}
 
 	wme = TAILQ_FIRST(&wp->modes);
 	if (wme != NULL && wme->mode->resize != NULL)

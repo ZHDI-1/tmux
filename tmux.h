@@ -73,6 +73,8 @@ struct options_entry;
 struct prompt;
 struct window_pane_prompt;
 struct pane_io;
+struct pane_worker;
+struct pane_work;
 struct redraw_damage;
 struct redraw_scene;
 struct redraw_span;
@@ -979,9 +981,19 @@ struct grid_line {
 	u_int			 time;
 	struct osc133_data	 osc133_data;
 	u_short			 flags;
-#ifdef ENABLE_IMAGES
-	struct image_line	*images;
-#endif
+	u_char			 shared;
+	u_char			 job_flags;
+#define GRID_SHARE_CELLS 0x1
+#define GRID_SHARE_EXTD  0x2
+};
+
+struct grid_row_node;
+struct grid_row_leaf;
+struct grid_row_cursor {
+	const struct grid_row_leaf *leaf;
+	uint64_t block;
+	int valid;
+	struct grid_line override;
 };
 
 /* Entire grid of cells. */
@@ -1000,13 +1012,41 @@ struct grid {
 	u_int			 scroll_collected;
 	u_int			 scroll_generation;
 
-	struct grid_line	*linedata;
-	u_int			 lineallocated;
+	struct grid_line	*viewport;
+	struct grid_line	*viewport_base;
+	u_int			 viewport_space;
+	struct grid_row_node	*rows;
+	uint64_t		 row_first;
+	struct grid_row_cursor	 row_read;
+	struct grid_row_leaf	*row_tail;
+	uint64_t		 row_tail_block;
+	int			 row_clear_wrap;
+	int			 row_private_tree;
 	struct grid_line	 spare; /* arrays from one discarded line */
 #ifdef ENABLE_IMAGES
 	struct image_store	*images;
 #endif
 };
+
+static inline int
+grid_worker_eligible(const struct grid *gd)
+{
+#ifdef ENABLE_IMAGES
+	return (gd->images == NULL);
+#else
+	(void)gd;
+	return (1);
+#endif
+}
+
+/* Enabled only for an explicitly traced worker parse. */
+struct grid_job_metrics {
+	uint64_t touched, copied_rows, packed_bytes, extended_bytes;
+	uint64_t promotions, probes, full_clears, growth_bytes, allocations;
+	uint64_t shared_appends, tail_forks, leaf_allocations, branch_allocations;
+	uint64_t wrap_materializations;
+};
+extern __thread struct grid_job_metrics *grid_job_metrics;
 
 /* Virtual cursor in a grid. */
 struct grid_reader {
@@ -1174,6 +1214,8 @@ struct screen_write_ctx {
 #define SCREEN_WRITE_OBSCURED 0x2
 #define SCREEN_WRITE_CHECKED_IF_OBSCURED 0x4
 #define SCREEN_WRITE_INPUT 0x8
+#define SCREEN_WRITE_HEADLESS 0x10
+#define SCREEN_WRITE_SCROLL_ON_CLEAR 0x20
 
 	screen_write_init_ctx_cb	 init_ctx_cb;
 	void				*arg;
@@ -3627,8 +3669,30 @@ void	 grid_set_cells(struct grid *, u_int, u_int, const struct grid_cell *,
 	     const char *, size_t);
 void	 grid_set_utf8_cells(struct grid *, u_int, u_int,
 	     const struct grid_cell *, const utf8_char *, u_int, u_int);
-struct grid_line *grid_get_line(struct grid *, u_int);
-void	 grid_adjust_lines(struct grid *, u_int);
+const struct grid_line *grid_get_line(struct grid *, u_int);
+const struct grid_line *grid_read_line(const struct grid *,
+	     struct grid_row_cursor *, u_int);
+void	 grid_line_get_cell(const struct grid_line *, u_int, struct grid_cell *);
+char	*grid_string_line(const struct grid_line *, u_int, u_int,
+	     struct grid_cell **, int, struct screen *);
+struct grid_line *grid_edit_line_record(struct grid *, u_int);
+void	 grid_copy_line_data(struct grid_line *, const struct grid_line *);
+void	 grid_share_lines(struct grid *, struct grid *);
+void	 grid_trim_history(struct grid *, u_int);
+const struct grid_line *grid_rows_get(struct grid *, u_int);
+const struct grid_line *grid_rows_read(const struct grid *,
+	     struct grid_row_cursor *, u_int);
+void	 grid_rows_append(struct grid *, const struct grid_line *);
+void	 grid_rows_trim(struct grid *, u_int);
+void	 grid_rows_pop(struct grid *, u_int);
+void	 grid_rows_share(struct grid *, struct grid *);
+void	 grid_rows_handoff(struct grid *, struct grid *);
+void	 grid_rows_return_tail(struct grid *, struct grid *);
+void	 grid_clear_wrapped(struct grid *, u_int);
+void	 grid_rows_release(struct grid *);
+int	 grid_rows_reclaim(u_int);
+void	 grid_scroll_history_resize(struct grid *);
+void	 grid_resize_viewport(struct grid *, u_int, u_int);
 void	 grid_clear(struct grid *, u_int, u_int, u_int, u_int, u_int);
 void	 grid_clear_lines(struct grid *, u_int, u_int, u_int);
 void	 grid_move_lines(struct grid *, u_int, u_int, u_int, u_int);
@@ -3691,6 +3755,7 @@ char	*grid_view_string_cells(struct grid *, u_int, u_int, u_int);
 /* screen-write.c */
 void	 screen_write_make_list(struct screen *);
 void	 screen_write_free_list(struct screen *);
+void	 screen_write_worker_cleanup(void);
 void	 screen_write_start_pane(struct screen_write_ctx *,
 	     struct window_pane *, struct screen *);
 void	 screen_write_start(struct screen_write_ctx *, struct screen *);
@@ -3728,6 +3793,7 @@ void	 screen_write_mode_clear(struct screen_write_ctx *, int);
 void	 screen_write_start_sync(struct window_pane *);
 void	 screen_write_stop_sync(struct window_pane *);
 void	 screen_write_end_sync(struct screen_write_ctx *);
+void	 screen_write_sync_worker_dirty(struct window_pane *);
 void	 screen_write_sync_clear_dirty(struct window_pane *);
 void	 screen_write_cursorup(struct screen_write_ctx *, u_int);
 void	 screen_write_cursordown(struct screen_write_ctx *, u_int);
@@ -3853,6 +3919,45 @@ int		 pane_io_start(struct window_pane *);
 void		 pane_io_destroy(struct window_pane *);
 void		 pane_io_set_read(struct window_pane *, int);
 int		 pane_io_finished(struct window_pane *);
+void		 pane_io_worker_ready(struct window_pane *);
+void		 pane_io_invalidate(struct window_pane *);
+int		 pane_io_resize(struct window_pane *);
+int		 pane_io_resize_pending(struct window_pane *);
+int		 pane_io_resize_copy(struct window_pane *);
+int		 window_pane_io_direct(struct window_pane *);
+void		 window_pane_io_advance(struct window_pane *, size_t);
+
+void		 xpool_retain(void *);
+void		xpool_free_private(void *);
+void		xpool_release(void *);
+int		xpool_unique(void *);
+void		*xpool_reallocarray_private(void *, size_t, size_t);
+
+extern int pane_workers_enabled;
+extern __thread int pane_worker_thread;
+extern __thread time_t pane_worker_time;
+void		 pane_workers_init(void);
+struct pane_worker *pane_worker_create(struct window_pane *);
+void		 pane_worker_destroy(struct pane_worker *, void *);
+int		 pane_worker_busy(struct pane_worker *);
+int		 pane_worker_submit(struct pane_worker *, struct window_pane *,
+		     const u_char *, size_t, u_int, u_int, int);
+int		 pane_worker_submit_copy(struct pane_worker *, struct screen *,
+		     u_int, u_int, u_int, u_int, uint64_t);
+uint64_t	 pane_worker_copy_token(const struct pane_work *);
+void		 pane_worker_apply_copy(struct pane_work *, struct screen *,
+		     u_int *, u_int *);
+int		 window_copy_worker_submit(struct window_pane *, struct pane_worker *);
+int		 window_copy_worker_finish(struct window_pane *, struct pane_work *);
+struct pane_work *pane_worker_take(struct pane_worker *);
+size_t		 pane_worker_apply(struct pane_work *, struct window_pane *, FILE *);
+void		 pane_worker_reject(struct pane_work *, struct window_pane *, FILE *);
+void		 pane_worker_discard(struct pane_work *);
+struct input_ctx *input_worker_clone(const struct input_ctx *);
+size_t		 input_worker_parse(struct input_ctx *, struct screen *,
+		     const u_char *, size_t, int);
+void		 input_worker_commit(struct window_pane *, const struct input_ctx *);
+void		 input_worker_free(struct input_ctx *);
 void		 window_pane_utmp_add(struct window_pane *);
 void		 window_pane_utmp_remove(struct window_pane *);
 void		 window_pane_wait_finish(struct window_pane *);
@@ -4302,8 +4407,9 @@ void	log_open(const char *);
 void	log_toggle(const char *);
 void	log_close(void);
 void printflike(1, 2) log_debug(const char *, ...);
+#define log_debug_active() (!pane_worker_thread && log_debug_enabled)
 #define log_debug(...) do { \
-	if (log_debug_enabled) \
+	if (log_debug_active()) \
 		log_debug(__VA_ARGS__); \
 } while (0)
 __dead void printflike(1, 2) fatal(const char *, ...);
